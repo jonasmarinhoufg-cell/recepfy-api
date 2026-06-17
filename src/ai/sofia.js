@@ -12,31 +12,13 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Busca todas as configurações da clínica no Supabase
 async function getClinicConfig(clinicaId) {
   const [clinica, sofia, medicos, faqs, horarios] = await Promise.all([
-    supabase
-      .from('clinicas')
-      .select('*')
-      .eq('id', clinicaId)
-      .single(),
-    supabase
-      .from('sofia_configs')
-      .select('*')
-      .eq('clinica_id', clinicaId)
-      .single(),
-    supabase
-      .from('medicos')
-      .select('*')
-      .eq('clinica_id', clinicaId)
-      .eq('ativo', true),
-    supabase
-      .from('faqs')
-      .select('*')
-      .eq('clinica_id', clinicaId)
-      .order('ordem'),
-    supabase
-      .from('horarios_disponiveis')
+    supabase.from('clinicas').select('*').eq('id', clinicaId).single(),
+    supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).single(),
+    supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
+    supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
+    supabase.from('horarios_disponiveis')
       .select('*, medicos(nome)')
       .eq('clinica_id', clinicaId)
       .eq('disponivel', true)
@@ -56,15 +38,19 @@ async function getClinicConfig(clinicaId) {
   };
 }
 
-// Busca ou cria conversa ativa do paciente
 async function getOrCreateConversa(clinicaId, pacienteId) {
-  // Busca conversa ativa
+  // Busca conversa ativa criada há menos de 2 horas
+  const duasHorasAtras = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
   const { data: conversa } = await supabase
     .from('conversas')
     .select('*')
     .eq('clinica_id', clinicaId)
     .eq('paciente_id', pacienteId)
     .eq('status', 'ativa')
+    .gte('iniciada_em', duasHorasAtras)
+    .order('iniciada_em', { ascending: false })
+    .limit(1)
     .single();
 
   if (conversa) return conversa;
@@ -84,14 +70,13 @@ async function getOrCreateConversa(clinicaId, pacienteId) {
   return novaConversa;
 }
 
-// Busca histórico de mensagens da conversa
 async function getHistorico(conversaId) {
   const { data } = await supabase
     .from('mensagens')
     .select('role, conteudo')
     .eq('conversa_id', conversaId)
     .order('created_at', { ascending: true })
-    .limit(20);
+    .limit(10); // máximo 10 mensagens — evita contexto longo demais
 
   return (data || []).map(m => ({
     role: m.role,
@@ -99,7 +84,6 @@ async function getHistorico(conversaId) {
   }));
 }
 
-// Busca ou cria paciente pelo telefone
 async function getOrCreatePaciente(clinicaId, telefone) {
   const { data: paciente } = await supabase
     .from('pacientes')
@@ -109,7 +93,6 @@ async function getOrCreatePaciente(clinicaId, telefone) {
     .single();
 
   if (paciente) {
-    // Atualiza último contato
     await supabase
       .from('pacientes')
       .update({ ultimo_contato: new Date().toISOString() })
@@ -117,7 +100,6 @@ async function getOrCreatePaciente(clinicaId, telefone) {
     return paciente;
   }
 
-  // Cria novo paciente
   const { data: novoPaciente } = await supabase
     .from('pacientes')
     .insert({
@@ -131,7 +113,6 @@ async function getOrCreatePaciente(clinicaId, telefone) {
   return novoPaciente;
 }
 
-// Salva mensagem no banco
 async function salvarMensagem(conversaId, role, conteudo, tokens = 0) {
   await supabase.from('mensagens').insert({
     conversa_id: conversaId,
@@ -141,9 +122,18 @@ async function salvarMensagem(conversaId, role, conteudo, tokens = 0) {
   });
 }
 
-// Salva agendamento e notifica médico
+async function encerrarConversa(conversaId, resolucao = 'ia') {
+  await supabase
+    .from('conversas')
+    .update({
+      status: 'encerrada',
+      resolucao,
+      encerrada_em: new Date().toISOString()
+    })
+    .eq('id', conversaId);
+}
+
 async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking) {
-  // Busca médico pelo nome
   const { data: medico } = await supabase
     .from('medicos')
     .select('id')
@@ -151,7 +141,6 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking) {
     .ilike('nome', `%${booking.medico}%`)
     .single();
 
-  // Salva agendamento
   const { data: agendamento } = await supabase
     .from('agendamentos')
     .insert({
@@ -167,7 +156,6 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking) {
     .select()
     .single();
 
-  // Cria notificação para o médico
   if (medico) {
     await supabase.from('notificacoes').insert({
       clinica_id: clinicaId,
@@ -181,26 +169,17 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking) {
   return agendamento;
 }
 
-// Função principal — processa mensagem do paciente
 async function processarMensagem(clinicaId, telefone, mensagem) {
   try {
-    // 1. Busca configurações da clínica
     const config = await getClinicConfig(clinicaId);
     if (!config.clinica) throw new Error('Clínica não encontrada');
 
-    // 2. Busca ou cria paciente
     const paciente = await getOrCreatePaciente(clinicaId, telefone);
-
-    // 3. Busca ou cria conversa ativa
     const conversa = await getOrCreateConversa(clinicaId, paciente.id);
-
-    // 4. Busca histórico
     const historico = await getHistorico(conversa.id);
 
-    // 5. Salva mensagem do paciente
     await salvarMensagem(conversa.id, 'user', mensagem);
 
-    // 6. Monta prompt e chama Claude
     const systemPrompt = buildPrompt(config);
     const messages = [
       ...historico,
@@ -214,14 +193,9 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       messages
     });
 
-    const rawText = response.content
-      .map(b => b.text || '')
-      .join('');
-
-    // 7. Parseia resposta
+    const rawText = response.content.map(b => b.text || '').join('');
     const parsed = parseResponse(rawText);
 
-    // 8. Salva resposta da Sofia
     await salvarMensagem(
       conversa.id,
       'assistant',
@@ -229,23 +203,15 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       response.usage?.output_tokens || 0
     );
 
-    // 9. Processa agendamento se houver
+    // Encerra conversa após agendamento confirmado
     if (parsed.booking) {
-      await salvarAgendamento(
-        clinicaId,
-        paciente.id,
-        conversa.id,
-        parsed.booking
-      );
+      await salvarAgendamento(clinicaId, paciente.id, conversa.id, parsed.booking);
+      await encerrarConversa(conversa.id, 'ia');
     }
 
-    // 10. Processa handoff se necessário
+    // Encerra conversa em handoff
     if (parsed.handoff) {
-      await supabase
-        .from('conversas')
-        .update({ status: 'handoff' })
-        .eq('id', conversa.id);
-
+      await encerrarConversa(conversa.id, 'humano');
       await supabase.from('notificacoes').insert({
         clinica_id: clinicaId,
         tipo: 'handoff',
