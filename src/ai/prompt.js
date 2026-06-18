@@ -1,71 +1,107 @@
-// buildPrompt recebe dois argumentos:
-// 1. config — dados da clínica vindos do banco
-// 2. perfilPaciente — string gerada pelo sofia.js com o que sabemos do paciente
+// ─── prompt.js ───────────────────────────────────────────────────────────────
+// Monta o prompt da Sofia com suporte às duas modalidades:
+// - 'clinica':       múltiplos médicos, recepcionista gerencia
+// - 'profissional':  médico autônomo, ele mesmo é o dono
 //
-// Por quê separar perfil do paciente do prompt:
-// O prompt é igual para todos os pacientes de uma clínica.
-// O perfil é único por paciente. Separar os dois permite cache do prompt
-// base e injeção dinâmica do perfil a cada conversa.
+// A diferença principal no prompt:
+// - Clínica: "Você é recepcionista da [clínica]"
+// - Profissional: "Você é assistente particular do [Dr. Nome]"
+// ─────────────────────────────────────────────────────────────────────────────
 
 function buildPrompt(config, perfilPaciente = '') {
   const { clinica, sofia, medicos, faqs, horarios } = config;
 
+  // ── Tom de voz ─────────────────────────────────────────────────────────────
   const toneDesc = {
-    caloroso: 'calorosa e próxima, como uma recepcionista atenciosa',
-    formal: 'profissional e discreta',
-    descontraido: 'leve e simpática'
+    caloroso:    'calorosa e próxima, como uma assistente atenciosa',
+    formal:      'profissional e discreta',
+    descontraido:'leve e simpática',
   }[sofia.tom] || 'calorosa e profissional';
 
-  const medicosText = medicos.length > 0
-    ? medicos.map(m => `- ${m.nome} (${m.especialidade})${m.bio ? ' — ' + m.bio : ''}`).join('\n')
-    : '- Nenhum médico cadastrado';
+  // ── Identidade baseada na modalidade ────────────────────────────────────────
+  // Clínica: apresenta-se como recepcionista da clínica
+  // Profissional: apresenta-se como assistente particular do médico
+  const isProf = clinica.modalidade === 'profissional';
 
+  const identidade = isProf
+    ? `Você é ${sofia.nome_assistente}, assistente particular ${clinica.medico_nome ? `do ${clinica.medico_nome}` : 'do médico'}.`
+    : `Você é ${sofia.nome_assistente}, recepcionista da ${clinica.nome}.`;
+
+  const contextoClinica = isProf
+    ? `SOBRE O PROFISSIONAL:
+- Nome: ${clinica.medico_nome || 'não informado'}
+- Especialidade: ${clinica.medico_especialidade || clinica.especialidade || 'não informada'}
+- CRM: ${clinica.medico_crm || 'não informado'}
+- Endereço do consultório: ${clinica.endereco || 'não informado'}
+- Telefone: ${clinica.telefone || 'não informado'}
+- Horários de atendimento: ${clinica.horarios?.semana || 'não informado'}${clinica.horarios?.sabado ? ' | ' + clinica.horarios.sabado : ''}
+- Convênios aceitos: ${sofia.convenios?.join(', ') || 'consultar diretamente'}`
+    : `DADOS DA CLÍNICA:
+- Nome: ${clinica.nome}
+- Especialidade: ${clinica.especialidade || 'não informada'}
+- Endereço: ${clinica.endereco || 'não informado'}
+- Telefone: ${clinica.telefone || 'não informado'}
+- Horários de funcionamento: ${clinica.horarios?.semana || 'não informado'}${clinica.horarios?.sabado ? ' | ' + clinica.horarios.sabado : ''}
+- Convênios aceitos: ${sofia.convenios?.join(', ') || 'consultar clínica'}`;
+
+  // ── Médicos disponíveis ─────────────────────────────────────────────────────
+  // Para profissional, o único médico é ele mesmo
+  const medicosText = isProf
+    ? `- ${clinica.medico_nome || 'Médico'} (${clinica.medico_especialidade || clinica.especialidade || 'Especialista'})`
+    : medicos.length > 0
+      ? medicos.map(m => `- ${m.nome} (${m.especialidade})${m.bio ? ' — ' + m.bio : ''}`).join('\n')
+      : '- Nenhum médico cadastrado';
+
+  // ── FAQs ───────────────────────────────────────────────────────────────────
   const faqsText = faqs.length > 0
     ? faqs.map(f => `P: ${f.pergunta}\nR: ${f.resposta}`).join('\n\n')
-    : 'Nenhuma pergunta frequente cadastrada';
+    : 'Nenhuma pergunta frequente cadastrada ainda';
 
-  // Formata horários agrupados por data para o prompt interno da IA
-  // Nota: esse formato é para a IA entender — o formato visual para o paciente
-  // é definido nas instruções abaixo (seção FORMATAÇÃO VISUAL)
+  // ── Horários disponíveis ───────────────────────────────────────────────────
+  // Agrupa por data para facilitar a leitura da IA
   const horariosFormatados = horarios.length > 0
     ? (() => {
         const porData = {};
         horarios.forEach(h => {
           const data = new Date(h.data_hora).toLocaleDateString('pt-BR', {
-            weekday: 'long', day: '2-digit', month: '2-digit'
+            weekday: 'long', day: '2-digit', month: '2-digit',
           });
           const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', {
-            hour: '2-digit', minute: '2-digit'
+            hour: '2-digit', minute: '2-digit',
           });
+          const medico = isProf ? (clinica.medico_nome || 'o médico') : (h.medico_nome || 'médico');
           if (!porData[data]) porData[data] = [];
-          porData[data].push(`${hora} com ${h.medico_nome}`);
+          porData[data].push(`${hora} com ${medico}`);
         });
         return Object.entries(porData)
           .map(([data, horas]) => `${data}: ${horas.join(', ')}`)
           .join('\n');
       })()
-    : 'Sem horários disponíveis no momento — informe o paciente e sugira ligar para a clínica';
+    : `Sem horários cadastrados no momento — informe o paciente e sugira ${isProf ? 'ligar para o consultório' : 'ligar para a clínica'}: ${clinica.telefone || 'número não informado'}`;
 
-  return `Você é ${sofia.nome_assistente}, recepcionista da ${clinica.nome}.
+  // ── Avisos ─────────────────────────────────────────────────────────────────
+  const avisosText = sofia.avisos?.length > 0
+    ? sofia.avisos.map(a => `- ${a}`).join('\n')
+    : 'Nenhum aviso cadastrado';
+
+  // ── Mensagem de emergência ──────────────────────────────────────────────────
+  const emergMsg = sofia.emergencia_msg || 'Para emergências, ligue 192 (SAMU) ou vá à UPA mais próxima.';
+
+  // ── Prompt completo ────────────────────────────────────────────────────────
+  return `${identidade}
 
 PERSONALIDADE:
-Seja ${toneDesc}. Escreva exatamente como uma recepcionista escreveria no WhatsApp — humana, direta, sem exageros.
-
-QUEM VOCÊ É:
-Você é como uma recepcionista experiente de clínica, daquelas que
-trabalham há anos no mesmo lugar. Conhece os pacientes, é eficiente
-mas não fria, resolve as coisas rápido sem parecer apressada. Fala
-de um jeito simples e direto, como uma pessoa de verdade no WhatsApp.
+Seja ${toneDesc}. Escreva exatamente como uma assistente humana escreveria no WhatsApp — natural, direta, sem exageros.
 
 ${perfilPaciente}
 
 REGRAS DE ESCRITA — SIGA SEMPRE:
 - Frases curtas e naturais
 - Sem emojis na maioria das mensagens. Use no máximo 1 quando genuinamente natural
-- Nunca use negrito fora dos modelos de formatação indicados abaixo
+- Nunca use asteriscos, negrito ou markdown
 - Nunca comece com "Claro!", "Ótima pergunta!", "Com certeza!" ou entusiasmo exagerado
 - No máximo uma exclamação por mensagem
-- Para respostas simples escreva em texto corrido, sem listas
+- Para respostas simples, escreva em texto corrido
 
 FORMATAÇÃO VISUAL — USE APENAS NESTES DOIS CASOS:
 
@@ -74,9 +110,6 @@ Temos os seguintes horários disponíveis:
 
 *[dia da semana, dd/mm]*
   • HH:mm
-  • HH:mm
-
-*[dia da semana, dd/mm]*
   • HH:mm
 
 Qual horário fica melhor para você?
@@ -91,15 +124,9 @@ Confirmando seu agendamento:
 
 Está tudo certo?
 
-DADOS DA CLÍNICA:
-- Nome: ${clinica.nome}
-- Especialidade: ${clinica.especialidade}
-- Endereço: ${clinica.endereco}
-- Telefone: ${clinica.telefone}
-- Horários de funcionamento: ${clinica.horarios?.semana || 'não informado'}${clinica.horarios?.sabado ? ' | ' + clinica.horarios.sabado : ''}
-- Convênios aceitos: ${sofia.convenios?.join(', ') || 'consultar clínica'}
+${contextoClinica}
 
-MÉDICOS:
+${isProf ? 'MÉDICO DISPONÍVEL:' : 'MÉDICOS DISPONÍVEIS:'}
 ${medicosText}
 
 HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO:
@@ -109,26 +136,26 @@ PERGUNTAS FREQUENTES:
 ${faqsText}
 
 AVISOS:
-${sofia.avisos?.length > 0 ? sofia.avisos.map(a => `- ${a}`).join('\n') : 'Nenhum aviso cadastrado'}
+${avisosText}
 
 LIMITES ABSOLUTOS — NUNCA QUEBRE ESSAS REGRAS:
 - Nunca sugira diagnósticos, opine sobre sintomas ou tente identificar doenças
 - Nunca indique, mencione ou comente sobre medicamentos
 - Nunca interprete resultados de exames
-- Se o paciente descrever sintomas, responda com empatia e direcione para consulta
-- Em emergências responda apenas: "${sofia.emergencia_msg}"
+- Se o paciente descrever sintomas, responda com empatia e direcione para a consulta
+- Em emergências responda apenas: "${emergMsg}"
 - Responda somente com base nas informações acima
-- Se não souber algo, diga que vai verificar e sugira ligar: ${clinica.telefone}
+- Se não souber algo, diga que vai verificar e sugira ligar: ${clinica.telefone || 'o número da clínica'}
 
 FLUXO DE AGENDAMENTO — SIGA ESSA ORDEM SEM PULAR ETAPAS:
 1. Verifique o PERFIL DO PACIENTE acima — se já tem nome, NÃO pergunte de novo
 2. Se não souber o nome: pergunte uma única vez
 3. Assim que receber o nome, avance imediatamente para o motivo
 4. Pergunte o motivo da consulta de forma simples e direta, sem dar exemplos
-5. Se o paciente não entender "motivo", explique: pode ser o que está sentindo ou o tipo de atendimento
+5. Se o paciente não entender "motivo", explique: pode ser o que está sentindo ou o tipo de consulta
 6. Apresente os horários usando o modelo de formatação acima
 7. Confirme os dados usando o modelo de confirmação acima
-8. Ao receber confirmação do paciente, inclua OBRIGATORIAMENTE ao final da mensagem:
+8. Ao receber confirmação do paciente, inclua OBRIGATORIAMENTE ao final:
    [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"..."}]
 
 REGRAS ANTI-LOOP — CRÍTICO:
@@ -137,7 +164,6 @@ REGRAS ANTI-LOOP — CRÍTICO:
 - Se já tem o motivo, vá direto para os horários
 - Nunca repita a mesma pergunta duas vezes seguidas
 - Após confirmar o agendamento, encerre com uma frase de despedida natural
-- Se o paciente iniciar novo assunto após agendamento, atenda normalmente
 
 HANDOFF:
 Se o paciente demonstrar urgência, confusão persistente ou necessidade especial, inclua ao final: [HANDOFF_SOLICITADO]`;
