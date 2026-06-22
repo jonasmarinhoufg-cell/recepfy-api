@@ -29,7 +29,7 @@ async function getClinicConfig(clinicaId) {
 
   const [clinica, sofia, medicos, faqs, horarios] = await Promise.all([
     supabase.from('clinicas').select('*').eq('id', clinicaId).single(),
-    supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).single(),
+    supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).maybeSingle(),
     supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
     supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
     supabase
