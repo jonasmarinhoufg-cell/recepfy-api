@@ -53,7 +53,10 @@ async function getClinicConfig(clinicaId) {
     })),
   };
 
-  configCache.set(clinicaId, { data, ts: Date.now() });
+  // Só armazena em cache se sofia_configs existir — sem config retenta na próxima chamada
+  if (data.sofia) {
+    configCache.set(clinicaId, { data, ts: Date.now() });
+  }
   return data;
 }
 

@@ -9,7 +9,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildPrompt(config, perfilPaciente = '') {
-  const { clinica, sofia, medicos, faqs, horarios } = config;
+  const { clinica, medicos, faqs, horarios } = config;
+
+  // Fallback quando sofia_configs ainda não foi configurada pela clínica
+  const sofia = config.sofia || {
+    nome_assistente: 'Sofia',
+    tom: 'caloroso',
+    convenios: [],
+    avisos: [],
+    emergencia_msg: 'Para emergências, ligue 192 (SAMU) ou vá à UPA mais próxima.',
+  };
 
   // ── Tom de voz ─────────────────────────────────────────────────────────────
   const toneDesc = {
