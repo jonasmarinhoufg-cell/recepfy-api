@@ -9,6 +9,36 @@ const { buildPrompt } = require('./prompt');
 const { parseResponse } = require('./parser');
 const { createClient } = require('@supabase/supabase-js');
 
+const BRT_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC-3
+
+// Converte data/hora do booking (strings em horário de Brasília) para ISO UTC
+function parseBookingDateTime(dataStr, horaStr) {
+  const dateMatch = (dataStr || '').match(/(\d{1,2})\/(\d{1,2})/);
+  const timeMatch = (horaStr  || '').match(/(\d{1,2})[h:](\d{2})/i);
+  if (!dateMatch) return new Date().toISOString();
+
+  const day     = parseInt(dateMatch[1]);
+  const month   = parseInt(dateMatch[2]) - 1; // 0-indexed
+  const hours   = timeMatch ? parseInt(timeMatch[1]) : 8;
+  const minutes = timeMatch ? parseInt(timeMatch[2]) : 0;
+
+  const now  = new Date();
+  let   year = now.getUTCFullYear();
+  // Se a data já passou no ano atual, assume o próximo
+  const tentativa = new Date(Date.UTC(year, month, day, hours + 3, minutes));
+  if (tentativa < now) year++;
+
+  return new Date(Date.UTC(year, month, day, hours + 3, minutes)).toISOString();
+}
+
+// Formata um timestamp UTC para exibição em horário de Brasília
+function formatBRT(isoString, opts = {}) {
+  return new Date(isoString).toLocaleString('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    ...opts,
+  });
+}
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const supabase = createClient(
@@ -147,7 +177,7 @@ async function getAgendamentoRecente(clinicaId, pacienteId) {
   return {
     ...data,
     medico_nome: data.medicos?.nome || 'médico',
-    data_hora_formatada: new Date(data.data_hora).toLocaleString('pt-BR', {
+    data_hora_formatada: formatBRT(data.data_hora, {
       weekday: 'long', day: '2-digit', month: '2-digit',
       hour: '2-digit', minute: '2-digit',
     }),
@@ -230,7 +260,7 @@ async function cancelarAgendamento(clinicaId, pacienteId) {
       medico_id:  data.medico_id,
       tipo:       'cancelamento',
       titulo:     'Consulta cancelada pelo paciente',
-      corpo:      `Agendamento de ${new Date(data.data_hora).toLocaleString('pt-BR')} foi cancelado via WhatsApp.`,
+      corpo:      `Agendamento de ${formatBRT(data.data_hora)} foi cancelado via WhatsApp.`,
     });
   }
 
@@ -291,7 +321,7 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
     paciente_id: pacienteId,
     conversa_id: conversaId,
     medico_id: medicoId,
-    data_hora: new Date().toISOString(),
+    data_hora: parseBookingDateTime(booking.data, booking.hora),
     motivo: booking.motivo,
     status: 'confirmado',
     origem: 'sofia',

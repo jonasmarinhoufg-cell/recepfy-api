@@ -72,11 +72,12 @@ function buildPrompt(config, perfilPaciente = '') {
     ? (() => {
         const porData = {};
         horarios.forEach(h => {
+          const opts = { timeZone: 'America/Sao_Paulo' };
           const data = new Date(h.data_hora).toLocaleDateString('pt-BR', {
-            weekday: 'long', day: '2-digit', month: '2-digit',
+            ...opts, weekday: 'long', day: '2-digit', month: '2-digit',
           });
           const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', {
-            hour: '2-digit', minute: '2-digit',
+            ...opts, hour: '2-digit', minute: '2-digit',
           });
           const medico = isProf ? (clinica.medico_nome || 'o médico') : (h.medico_nome || 'médico');
           if (!porData[data]) porData[data] = [];
