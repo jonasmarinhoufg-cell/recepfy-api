@@ -7,19 +7,15 @@ const evolutionClient = axios.create({
   baseURL: EVOLUTION_URL,
   headers: {
     'apikey': EVOLUTION_KEY,
-    'Content-Type': 'application/json'
-  }
+    'Content-Type': 'application/json',
+  },
 });
 
-// Envia mensagem de texto para um número
 async function sendMessage(instanceName, phone, message) {
   try {
     const response = await evolutionClient.post(
       `/message/sendText/${instanceName}`,
-      {
-        number: phone,
-        text: message
-      }
+      { number: phone, text: message }
     );
     return response.data;
   } catch (error) {
@@ -28,4 +24,16 @@ async function sendMessage(instanceName, phone, message) {
   }
 }
 
-module.exports = { sendMessage };
+// Simula "digitando..." enquanto a Sofia processa — melhora percepção de velocidade
+async function sendTyping(instanceName, phone) {
+  try {
+    await evolutionClient.post(`/chat/sendPresence/${instanceName}`, {
+      number: phone,
+      options: { presence: 'composing', delay: 4000 },
+    });
+  } catch {
+    // não crítico — ignora silenciosamente
+  }
+}
+
+module.exports = { sendMessage, sendTyping };

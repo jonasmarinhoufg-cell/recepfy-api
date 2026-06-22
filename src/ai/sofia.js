@@ -111,7 +111,7 @@ function buildPerfilPaciente(paciente, agendamentoRecente) {
   if (paciente.convenio) perfil += `\n- Convênio registrado: ${paciente.convenio}`;
 
   if (agendamentoRecente) {
-    perfil += `\n- Tem consulta agendada: ${agendamentoRecente.data_hora_formatada} com ${agendamentoRecente.medico_nome}`;
+    perfil += `\n- Consulta agendada: ${agendamentoRecente.data_hora_formatada} com ${agendamentoRecente.medico_nome} (ID interno: ${agendamentoRecente.id})`;
     perfil += `\n- Status: ${agendamentoRecente.status}`;
   }
 
@@ -120,7 +120,7 @@ function buildPerfilPaciente(paciente, agendamentoRecente) {
   }
 
   if (agendamentoRecente?.status === 'confirmado') {
-    perfil += `\nINSTRUÇÃO: Este paciente tem consulta agendada. Se perguntar, confirme os dados acima.`;
+    perfil += `\nINSTRUÇÃO: Este paciente tem consulta agendada. Se perguntar, confirme os dados acima. Se quiser cancelar, siga o fluxo de cancelamento.`;
   }
 
   return perfil;
@@ -202,6 +202,39 @@ async function salvarMensagem(conversaId, role, conteudo, tokens = 0) {
     conversa_id: conversaId, role, conteudo, tokens_usados: tokens,
   });
   if (error) console.error('Erro ao salvar mensagem:', error.message);
+}
+
+async function cancelarAgendamento(clinicaId, pacienteId) {
+  // Busca o próximo agendamento confirmado do paciente
+  const { data } = await supabase
+    .from('agendamentos')
+    .select('id, medico_id, data_hora')
+    .eq('clinica_id', clinicaId)
+    .eq('paciente_id', pacienteId)
+    .in('status', ['confirmado', 'reagendado'])
+    .gte('data_hora', new Date().toISOString())
+    .order('data_hora', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (!data) return false;
+
+  await supabase.from('agendamentos')
+    .update({ status: 'cancelado' })
+    .eq('id', data.id);
+
+  // Notifica a clínica
+  if (data.medico_id) {
+    await supabase.from('notificacoes').insert({
+      clinica_id: clinicaId,
+      medico_id:  data.medico_id,
+      tipo:       'cancelamento',
+      titulo:     'Consulta cancelada pelo paciente',
+      corpo:      `Agendamento de ${new Date(data.data_hora).toLocaleString('pt-BR')} foi cancelado via WhatsApp.`,
+    });
+  }
+
+  return true;
 }
 
 async function encerrarConversa(conversaId, resolucao = 'ia') {
@@ -333,7 +366,13 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       await encerrarConversa(conversa.id, 'ia');
     }
 
-    // 9. Handoff — encerra e notifica
+    // 9. Cancelamento confirmado
+    if (parsed.cancelamento) {
+      await cancelarAgendamento(clinicaId, paciente.id);
+      await encerrarConversa(conversa.id, 'ia');
+    }
+
+    // 10. Handoff — encerra e notifica
     if (parsed.handoff) {
       await encerrarConversa(conversa.id, 'humano');
       await supabase.from('notificacoes').insert({
