@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { processarMensagem } = require('../ai/sofia');
+const { transcribeAudioMessage } = require('../ai/transcriber');
 const { sendMessage, sendTyping } = require('../whatsapp/sender');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -30,10 +31,38 @@ router.post('/whatsapp', async (req, res) => {
                      data.message?.extendedTextMessage?.text ||
                      '';
 
-    // Mensagem de mídia (áudio, imagem, vídeo, documento, sticker) — pede para digitar
+    // Áudio (voz ou arquivo de áudio) — transcreve com Whisper
+    const temAudio = data.message?.audioMessage || data.message?.pttMessage;
+    if (!mensagem && temAudio) {
+      res.sendStatus(200);
+      const { data: instancia } = await supabase
+        .from('whatsapp_instancias').select('clinica_id')
+        .eq('instance_name', instanceName).single();
+      if (!instancia) return;
+
+      try {
+        const transcricao = await transcribeAudioMessage(instanceName, data.key, data.message);
+        if (!transcricao) throw new Error('Transcrição vazia');
+
+        const delay = Math.floor(Math.random() * 3000) + 2000;
+        await new Promise(r => setTimeout(r, delay));
+        await sendTyping(instanceName, telefone);
+
+        const resposta = await processarMensagem(instancia.clinica_id, telefone, transcricao);
+        await sendMessage(instanceName, telefone, resposta);
+      } catch (e) {
+        console.error('Erro ao transcrever áudio:', e.message);
+        await new Promise(r => setTimeout(r, 1200));
+        await sendMessage(instanceName, telefone,
+          'Não consegui ouvir seu áudio. Pode digitar o que precisa? 🙏'
+        );
+      }
+      return;
+    }
+
+    // Outros mídia (imagem, vídeo, documento, sticker) — pede para digitar
     if (!mensagem) {
       const temMidia = data.message && (
-        data.message.audioMessage    ||
         data.message.imageMessage    ||
         data.message.videoMessage    ||
         data.message.documentMessage ||
