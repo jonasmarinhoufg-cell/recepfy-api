@@ -11,86 +11,30 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Rota de saúde — confirma que o servidor está no ar
 app.get('/', (req, res) => {
-  res.json({
-    status: 200,
-    message: 'Recepfy API funcionando!',
-    version: '1.0.0'
-  });
+  res.json({ status: 200, message: 'Recepfy API funcionando!', version: '1.0.0' });
 });
 
-// Invalida cache de configuração de uma clínica
-// Chamado pelo painel web após salvar configs da Sofia
 app.post('/cache/invalidate', (req, res) => {
   const { clinica_id } = req.body || {};
   if (clinica_id) invalidateCache(clinica_id);
   res.sendStatus(200);
 });
 
-// Webhook do WhatsApp
-app.use('/webhooks', whatsappWebhook);
-
-const { getRecentEvents } = require('./webhooks/whatsapp');
-app.get('/debug/events', (req, res) => res.json(getRecentEvents()));
-
-
-// Envia mensagem de teste e retorna resposta completa da Evolution API
-app.post('/admin/test-send', async (req, res) => {
-  const { instance_name, number, text = 'Teste Sofia ✅' } = req.body || {};
-  if (!instance_name || !number) return res.status(400).json({ error: 'instance_name e number obrigatórios' });
-  const evoUrl = process.env.EVOLUTION_API_URL;
-  const evoKey = process.env.EVOLUTION_API_KEY;
-  try {
-    const axios = require('axios');
-    const response = await axios.post(
-      `${evoUrl}/message/sendText/${instance_name}`,
-      { number, text },
-      { headers: { apikey: evoKey, 'Content-Type': 'application/json' } }
-    );
-    res.json({ ok: true, status: response.status, data: response.data });
-  } catch (e) {
-    res.status(500).json({ ok: false, status: e.response?.status, error: e.message, data: e.response?.data });
-  }
-});
-
-// Verifica estado REAL da conexão e testa envio de mensagem
-app.get('/admin/check/:instance', async (req, res) => {
-  const evoUrl = process.env.EVOLUTION_API_URL;
-  const evoKey = process.env.EVOLUTION_API_KEY;
-  const { instance } = req.params;
-  if (!evoUrl || !evoKey) return res.status(500).json({ error: 'Evolution API não configurada' });
-  try {
-    const axios = require('axios');
-    const [stateRes, webhookRes] = await Promise.all([
-      axios.get(`${evoUrl}/instance/connectionState/${instance}`, { headers: { apikey: evoKey } }).catch(e => ({ data: { error: e.message } })),
-      axios.get(`${evoUrl}/webhook/find/${instance}`, { headers: { apikey: evoKey } }).catch(e => ({ data: { error: e.message } })),
-    ]);
-    res.json({ connectionState: stateRes.data, webhook: webhookRes.data });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Reconfigura o webhook de uma instância na Evolution API
-// Usado para corrigir instâncias que perderam o webhook sem recriar a conexão
+// Reconfigura o webhook de uma instância sem recriar a conexão WhatsApp
 app.post('/admin/setup-webhook', async (req, res) => {
   const { instance_name } = req.body || {};
   if (!instance_name) return res.status(400).json({ error: 'instance_name obrigatório' });
-
   const evoUrl = process.env.EVOLUTION_API_URL;
   const evoKey = process.env.EVOLUTION_API_KEY;
-  const backendUrl = 'https://recepfy-api-production.up.railway.app';
-
   if (!evoUrl || !evoKey) return res.status(500).json({ error: 'Evolution API não configurada' });
-
   try {
     const axios = require('axios');
     const response = await axios.post(
       `${evoUrl}/webhook/set/${instance_name}`,
       {
         webhook: {
-          url: `${backendUrl}/webhooks/whatsapp`,
+          url: 'https://recepfy-api-production.up.railway.app/webhooks/whatsapp',
           enabled: true,
           webhookByEvents: false,
           webhookBase64: false,
@@ -99,12 +43,13 @@ app.post('/admin/setup-webhook', async (req, res) => {
       },
       { headers: { apikey: evoKey, 'Content-Type': 'application/json' } }
     );
-    console.log(`[WEBHOOK-SETUP] ${instance_name} → ${backendUrl}/webhooks/whatsapp`);
     res.json({ ok: true, instance: instance_name, data: response.data });
   } catch (e) {
     res.status(500).json({ error: e.message, detail: e.response?.data });
   }
 });
+
+app.use('/webhooks', whatsappWebhook);
 
 app.listen(PORT, () => {
   console.log(`Recepfy API rodando na porta ${PORT}`);
