@@ -31,6 +31,11 @@ app.post('/cache/invalidate', (req, res) => {
 // Webhook do WhatsApp
 app.use('/webhooks', whatsappWebhook);
 
+// Diagnóstico — retorna os últimos eventos processados pelo webhook
+// Usar apenas para debug, remover após resolver o problema
+const { getRecentEvents } = require('./webhooks/whatsapp');
+app.get('/debug/events', (req, res) => res.json(getRecentEvents()));
+
 app.listen(PORT, () => {
   console.log(`Recepfy API rodando na porta ${PORT}`);
 });

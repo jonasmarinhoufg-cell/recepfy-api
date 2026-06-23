@@ -10,6 +10,14 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// Armazena os últimos 10 eventos para diagnóstico via GET /debug/events
+const recentEvents = [];
+function logEvent(data) {
+  recentEvents.unshift({ ts: new Date().toISOString(), ...data });
+  if (recentEvents.length > 10) recentEvents.pop();
+}
+function getRecentEvents() { return recentEvents; }
+
 router.post('/whatsapp', async (req, res) => {
   try {
     const body = req.body;
@@ -18,6 +26,7 @@ router.post('/whatsapp', async (req, res) => {
     const ev = (body.event || '').toUpperCase().replace('.', '_');
     console.log(`[WH] event="${body.event}" ev="${ev}" instance="${body.instance}"`);
     if (ev !== 'MESSAGES_UPSERT') {
+      logEvent({ step: 'ignorado_event', event: body.event, ev });
       return res.sendStatus(200);
     }
 
@@ -109,6 +118,7 @@ router.post('/whatsapp', async (req, res) => {
     }
 
     console.log(`[WH] processando: clinica=${instancia.clinica_id}`);
+    logEvent({ step: 'processando', instance: instanceName, telefone, mensagem: mensagem.slice(0, 80) });
     res.sendStatus(200);
 
     // Delay humanizado + "digitando..." para parecer humano
@@ -116,19 +126,30 @@ router.post('/whatsapp', async (req, res) => {
     await new Promise(resolve => setTimeout(resolve, delay));
     await sendTyping(instanceName, telefone);
 
-    const resposta = await processarMensagem(
-      instancia.clinica_id,
-      telefone,
-      mensagem
-    );
+    let resposta;
+    try {
+      resposta = await processarMensagem(instancia.clinica_id, telefone, mensagem);
+      logEvent({ step: 'sofia_ok', chars: resposta?.length });
+    } catch (e) {
+      logEvent({ step: 'sofia_erro', erro: e.message });
+      throw e;
+    }
 
     console.log(`[WH] resposta gerada (${resposta?.length} chars), enviando...`);
-    await sendMessage(instanceName, telefone, resposta);
-    console.log('[WH] enviado com sucesso');
+    try {
+      await sendMessage(instanceName, telefone, resposta);
+      logEvent({ step: 'send_ok' });
+      console.log('[WH] enviado com sucesso');
+    } catch (e) {
+      logEvent({ step: 'send_erro', erro: e.message });
+      console.error('[WH] erro ao enviar:', e.message);
+    }
 
   } catch (error) {
+    logEvent({ step: 'webhook_erro', erro: error.message });
     console.error('[WH] erro:', error.message);
   }
 });
 
 module.exports = router;
+module.exports.getRecentEvents = getRecentEvents;
