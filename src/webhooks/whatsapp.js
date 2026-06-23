@@ -116,13 +116,17 @@ router.post('/whatsapp', async (req, res) => {
     }
 
     res.sendStatus(200);
+    console.log('[webhook] 200 enviado, iniciando processamento...');
 
     const delay = Math.floor(Math.random() * 3000) + 2000;
     await new Promise(resolve => setTimeout(resolve, delay));
-    await sendTyping(instanceName, telefone);
+    console.log('[webhook] delay OK, chamando processarMensagem...');
 
     const resposta = await processarMensagem(instancia.clinica_id, telefone, mensagem);
+    console.log('[webhook] resposta da Sofia:', resposta?.substring(0, 80));
+
     await sendMessage(instanceName, telefone, resposta);
+    console.log('[webhook] mensagem enviada com sucesso!');
 
   } catch (error) {
     console.error('Erro no webhook:', error.message);
