@@ -17,6 +17,11 @@ router.post('/whatsapp', async (req, res) => {
 
     // Evolution API v2 envia MESSAGES_UPSERT (maiúsculo) ou messages.upsert
     const ev = (body.event || '').toUpperCase().replace('.', '_');
+    if (ev === 'CONNECTION_UPDATE') {
+      const state = body.data?.state || body.data?.connection || JSON.stringify(body.data);
+      console.log('[webhook] connection.update | state:', state);
+      return res.sendStatus(200);
+    }
     if (ev !== 'MESSAGES_UPSERT') {
       return res.sendStatus(200);
     }
