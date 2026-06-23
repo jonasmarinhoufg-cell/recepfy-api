@@ -128,7 +128,7 @@ async function getOrCreatePaciente(clinicaId, telefone) {
 // O perfil é permanente — diferente do histórico que é por sessão
 
 function buildPerfilPaciente(paciente, agendamentoRecente) {
-  if (!paciente.nome && !agendamentoRecente) {
+  if (!paciente.nome && !agendamentoRecente && !paciente.memoria) {
     return `PERFIL DO PACIENTE:
 - Primeiro contato — não temos cadastro anterior
 - Não pergunte se ele já veio antes, apenas atenda normalmente`;
@@ -143,6 +143,10 @@ function buildPerfilPaciente(paciente, agendamentoRecente) {
   if (agendamentoRecente) {
     perfil += `\n- Consulta agendada: ${agendamentoRecente.data_hora_formatada} com ${agendamentoRecente.medico_nome} (ID interno: ${agendamentoRecente.id})`;
     perfil += `\n- Status: ${agendamentoRecente.status}`;
+  }
+
+  if (paciente.memoria) {
+    perfil += `\n\nHISTÓRICO DE ATENDIMENTOS ANTERIORES:\n${paciente.memoria}`;
   }
 
   if (paciente.nome) {
@@ -308,6 +312,61 @@ async function encerrarConversa(conversaId, resolucao = 'ia') {
     .eq('id', conversaId);
 }
 
+// ─── RESUMO E MEMÓRIA ─────────────────────────────────────────────────────────
+// Gera um resumo da conversa com Claude Haiku (modelo mais barato).
+// Salva o resumo acumulado no perfil do paciente para enriquecer conversas futuras.
+
+async function gerarResumoConversa(conversaId) {
+  const { data: msgs } = await supabase
+    .from('mensagens')
+    .select('role, conteudo')
+    .eq('conversa_id', conversaId)
+    .order('created_at', { ascending: true });
+
+  if (!msgs || msgs.length < 2) return null;
+
+  const texto = msgs
+    .map(m => `${m.role === 'user' ? 'Paciente' : 'Sofia'}: ${m.conteudo}`)
+    .join('\n');
+
+  try {
+    const resp = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 150,
+      messages: [{
+        role: 'user',
+        content: `Resuma em até 2 frases o que aconteceu nesta conversa e qualquer informação útil sobre o paciente (motivo, preferências, condições mencionadas, desfecho). Português, direto, sem introdução.\n\n${texto}`,
+      }],
+    });
+    return resp.content[0]?.text?.trim() || null;
+  } catch (e) {
+    console.error('Erro ao gerar resumo de conversa:', e.message);
+    return null;
+  }
+}
+
+async function salvarMemoriaPaciente(pacienteId, resumo) {
+  if (!resumo) return;
+  const data = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  const entrada = `[${data}] ${resumo}`;
+
+  const { data: p } = await supabase
+    .from('pacientes')
+    .select('memoria')
+    .eq('id', pacienteId)
+    .maybeSingle();
+
+  const memoriaAtual = p?.memoria || '';
+  // Mantém no máximo os últimos 1200 chars para não inflar o prompt
+  const nova = memoriaAtual
+    ? `${memoriaAtual}\n${entrada}`.slice(-1200)
+    : entrada;
+
+  await supabase.from('pacientes')
+    .update({ memoria: nova })
+    .eq('id', pacienteId);
+}
+
 async function atualizarNomePaciente(pacienteId, nome) {
   if (!nome || nome.trim().length < 3) return;
   await supabase.from('pacientes')
@@ -450,29 +509,41 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     if (parsed.booking) {
       await salvarAgendamento(clinicaId, paciente.id, conversa.id, parsed.booking, modalidade);
       await encerrarConversa(conversa.id, 'ia');
+      gerarResumoConversa(conversa.id)
+        .then(r => salvarMemoriaPaciente(paciente.id, r))
+        .catch(e => console.error('Resumo agendamento:', e.message));
     }
 
     // 9. Cancelamento confirmado
     if (parsed.cancelamento) {
       await cancelarAgendamento(clinicaId, paciente.id);
       await encerrarConversa(conversa.id, 'ia');
+      gerarResumoConversa(conversa.id)
+        .then(r => salvarMemoriaPaciente(paciente.id, r))
+        .catch(e => console.error('Resumo cancelamento:', e.message));
     }
 
     // 10. Reagendamento confirmado
     if (parsed.reagendamento) {
       await reagendarAgendamento(clinicaId, paciente.id, conversa.id, parsed.reagendamento, modalidade);
       await encerrarConversa(conversa.id, 'ia');
+      gerarResumoConversa(conversa.id)
+        .then(r => salvarMemoriaPaciente(paciente.id, r))
+        .catch(e => console.error('Resumo reagendamento:', e.message));
     }
 
-    // 11. Handoff — encerra com resolucao 'handoff' e notifica
+    // 11. Handoff — encerra, gera resumo para contexto do atendente e notifica
     if (parsed.handoff) {
       await encerrarConversa(conversa.id, 'handoff');
+      const resumo = await gerarResumoConversa(conversa.id);
+      if (resumo) salvarMemoriaPaciente(paciente.id, resumo).catch(e => console.error('Memória handoff:', e.message));
       const nomePaciente = paciente.nome || telefone;
+      const contexto = resumo ? `\n\nContexto: ${resumo}` : '';
       await supabase.from('notificacoes').insert({
         clinica_id: clinicaId,
         tipo: 'handoff',
         titulo: 'Paciente precisa de atendimento humano',
-        corpo: `${nomePaciente} (${telefone}) — "${mensagem}"`,
+        corpo: `${nomePaciente} (${telefone}) — "${mensagem}"${contexto}`,
       });
     }
 
