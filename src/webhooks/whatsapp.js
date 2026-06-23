@@ -10,51 +10,28 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Armazena os últimos 10 eventos para diagnóstico via GET /debug/events
-const recentEvents = [];
-function logEvent(data) {
-  recentEvents.unshift({ ts: new Date().toISOString(), ...data });
-  if (recentEvents.length > 10) recentEvents.pop();
-}
-function getRecentEvents() { return recentEvents; }
-
 router.post('/whatsapp', async (req, res) => {
   try {
     const body = req.body;
 
     // Evolution API v2 envia MESSAGES_UPSERT (maiúsculo) ou messages.upsert
     const ev = (body.event || '').toUpperCase().replace('.', '_');
-    console.log(`[WH] event="${body.event}" ev="${ev}" instance="${body.instance}"`);
     if (ev !== 'MESSAGES_UPSERT') {
-      logEvent({ step: 'ignorado_event', event: body.event, ev });
       return res.sendStatus(200);
     }
 
     const data = body.data;
 
-    if (data.key?.fromMe) {
-      logEvent({ step: 'ignorado_fromMe', instance: body.instance });
-      return res.sendStatus(200);
-    }
-    if (data.key?.remoteJid?.includes('@g.us')) {
-      logEvent({ step: 'ignorado_grupo', jid: data.key.remoteJid });
-      return res.sendStatus(200);
-    }
+    if (data.key?.fromMe) return res.sendStatus(200);
+    if (data.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
 
     const instanceName = body.instance;
     const telefone = data.key?.remoteJid?.replace('@s.whatsapp.net', '');
-    if (!telefone) {
-      logEvent({ step: 'ignorado_sem_telefone', remoteJid: data.key?.remoteJid });
-      return res.sendStatus(200);
-    }
+    if (!telefone) return res.sendStatus(200);
 
     const mensagem = data.message?.conversation ||
                      data.message?.extendedTextMessage?.text ||
                      '';
-
-    const msgKeys = Object.keys(data.message || {}).join(',');
-    logEvent({ step: 'recebido', instance: instanceName, telefone, mensagem: mensagem.slice(0, 80), msgKeys });
-    console.log(`[WH] fone=${telefone} msg="${mensagem.slice(0,60)}" msgKeys=${msgKeys}`);
 
     // Áudio (voz ou arquivo de áudio) — transcreve com Whisper
     const temAudio = data.message?.audioMessage || data.message?.pttMessage;
@@ -104,8 +81,6 @@ router.post('/whatsapp', async (req, res) => {
             'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?'
           );
         }
-      } else {
-        console.log('[WH] ignorado: sem mensagem e sem midia reconhecida');
       }
       return;
     }
@@ -115,12 +90,10 @@ router.post('/whatsapp', async (req, res) => {
       .eq('instance_name', instanceName).single();
 
     if (!instancia) {
-      console.log(`[WH] instância não encontrada: ${instanceName}`);
+      console.log(`Instância não encontrada: ${instanceName}`);
       return res.sendStatus(200);
     }
 
-    console.log(`[WH] processando: clinica=${instancia.clinica_id}`);
-    logEvent({ step: 'processando', instance: instanceName, telefone, mensagem: mensagem.slice(0, 80) });
     res.sendStatus(200);
 
     // Delay humanizado + "digitando..." para parecer humano
@@ -128,30 +101,17 @@ router.post('/whatsapp', async (req, res) => {
     await new Promise(resolve => setTimeout(resolve, delay));
     await sendTyping(instanceName, telefone);
 
-    let resposta;
-    try {
-      resposta = await processarMensagem(instancia.clinica_id, telefone, mensagem);
-      logEvent({ step: 'sofia_ok', chars: resposta?.length });
-    } catch (e) {
-      logEvent({ step: 'sofia_erro', erro: e.message });
-      throw e;
-    }
+    const resposta = await processarMensagem(
+      instancia.clinica_id,
+      telefone,
+      mensagem
+    );
 
-    console.log(`[WH] resposta gerada (${resposta?.length} chars), enviando...`);
-    try {
-      await sendMessage(instanceName, telefone, resposta);
-      logEvent({ step: 'send_ok' });
-      console.log('[WH] enviado com sucesso');
-    } catch (e) {
-      logEvent({ step: 'send_erro', erro: e.message });
-      console.error('[WH] erro ao enviar:', e.message);
-    }
+    await sendMessage(instanceName, telefone, resposta);
 
   } catch (error) {
-    logEvent({ step: 'webhook_erro', erro: error.message });
-    console.error('[WH] erro:', error.message);
+    console.error('Erro no webhook:', error.message);
   }
 });
 
 module.exports = router;
-module.exports.getRecentEvents = getRecentEvents;
