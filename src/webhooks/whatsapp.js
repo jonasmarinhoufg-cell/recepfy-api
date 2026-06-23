@@ -10,9 +10,14 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+const events = [];
+function logEv(d) { events.unshift({ ts: new Date().toISOString(), ...d }); if (events.length > 20) events.pop(); }
+function getRecentEvents() { return events; }
+
 router.post('/whatsapp', async (req, res) => {
+  const body = req.body;
+  logEv({ step: 'hit', event: body.event, instance: body.instance });
   try {
-    const body = req.body;
 
     // Evolution API v2 envia MESSAGES_UPSERT (maiúsculo) ou messages.upsert
     const ev = (body.event || '').toUpperCase().replace('.', '_');
@@ -115,3 +120,4 @@ router.post('/whatsapp', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.getRecentEvents = getRecentEvents;

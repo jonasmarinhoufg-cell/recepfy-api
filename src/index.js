@@ -31,6 +31,9 @@ app.post('/cache/invalidate', (req, res) => {
 // Webhook do WhatsApp
 app.use('/webhooks', whatsappWebhook);
 
+const { getRecentEvents } = require('./webhooks/whatsapp');
+app.get('/debug/events', (req, res) => res.json(getRecentEvents()));
+
 
 // Envia mensagem de teste e retorna resposta completa da Evolution API
 app.post('/admin/test-send', async (req, res) => {
