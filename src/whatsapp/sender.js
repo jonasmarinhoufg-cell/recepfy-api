@@ -20,10 +20,23 @@ function normalizeBrPhone(phone) {
   return phone;
 }
 
+async function checkConnectionState(instanceName) {
+  try {
+    const res = await evolutionClient.get(`/instance/connectionState/${instanceName}`);
+    return res.data;
+  } catch {
+    return null;
+  }
+}
+
 async function sendMessage(instanceName, phone, message) {
   const normalized = normalizeBrPhone(phone);
+
+  const state = await checkConnectionState(instanceName);
+  console.log('[sender] connectionState:', JSON.stringify(state));
+
   try {
-    console.log('[sender] POST sendText | instance:', instanceName, '| phone:', normalized, '| EVOLUTION_URL:', EVOLUTION_URL ? 'OK' : 'AUSENTE');
+    console.log('[sender] POST sendText | instance:', instanceName, '| phone:', normalized);
     const response = await evolutionClient.post(
       `/message/sendText/${instanceName}`,
       { number: normalized, text: message }
