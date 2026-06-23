@@ -27,7 +27,10 @@ router.post('/whatsapp', async (req, res) => {
 
     console.log('[webhook] fromMe:', data?.key?.fromMe, '| jid:', data?.key?.remoteJid);
 
-    if (data?.key?.fromMe) return res.sendStatus(200);
+    if (data?.key?.fromMe) {
+      console.log('[webhook] fromMe event | status:', data?.status, '| jid:', data?.key?.remoteJid);
+      return res.sendStatus(200);
+    }
     if (data?.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
 
     const instanceName = body.instance;
