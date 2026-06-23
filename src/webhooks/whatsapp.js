@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const router = express.Router();
 const { processarMensagem } = require('../ai/sofia');
 const { transcribeAudioMessage } = require('../ai/transcriber');
@@ -11,17 +11,10 @@ const supabase = createClient(
 );
 
 router.post('/whatsapp', async (req, res) => {
-  console.log('[webhook] event:', req.body?.event, '| instance:', req.body?.instance);
   try {
     const body = req.body;
 
-    // Evolution API v2 envia MESSAGES_UPSERT (maiúsculo) ou messages.upsert
     const ev = (body.event || '').toUpperCase().replace('.', '_');
-    if (ev === 'CONNECTION_UPDATE') {
-      const state = body.data?.state || body.data?.connection || JSON.stringify(body.data);
-      console.log('[webhook] connection.update | state:', state);
-      return res.sendStatus(200);
-    }
     if (ev !== 'MESSAGES_UPSERT') {
       return res.sendStatus(200);
     }
@@ -30,19 +23,12 @@ router.post('/whatsapp', async (req, res) => {
     const raw = body.data;
     const data = Array.isArray(raw) ? raw[0] : raw;
 
-    console.log('[webhook] fromMe:', data?.key?.fromMe, '| jid:', data?.key?.remoteJid);
-
-    if (data?.key?.fromMe) {
-      console.log('[webhook] fromMe event | status:', data?.status, '| jid:', data?.key?.remoteJid);
-      return res.sendStatus(200);
-    }
+    if (data?.key?.fromMe) return res.sendStatus(200);
     if (data?.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
 
     const instanceName = body.instance;
     const telefone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');
-    if (!telefone) { console.log('[webhook] sem telefone - jid:', data?.key?.remoteJid); return res.sendStatus(200); }
-
-    console.log('[webhook] message keys:', JSON.stringify(Object.keys(data?.message || {})));
+    if (!telefone) return res.sendStatus(200);
 
     // Extrai texto de todos os tipos comuns de mensagem de texto
     const mensagem = data?.message?.conversation ||
@@ -87,7 +73,6 @@ router.post('/whatsapp', async (req, res) => {
 
     // Outros mídia (imagem, vídeo, documento, sticker) — pede para digitar
     if (!mensagem) {
-      console.log('[webhook] mensagem vazia - keys:', JSON.stringify(Object.keys(data?.message || {})));
       const temMidia = data.message && (
         data.message.imageMessage    ||
         data.message.videoMessage    ||
@@ -109,32 +94,23 @@ router.post('/whatsapp', async (req, res) => {
       return;
     }
 
-    console.log('[webhook] mensagem extraída:', mensagem.substring(0, 80));
-    console.log('[webhook] buscando instancia:', instanceName, '| SUPABASE_URL:', process.env.SUPABASE_URL ? 'OK' : 'AUSENTE');
-
-    const { data: instancia, error: supaErr } = await supabase
+    const { data: instancia } = await supabase
       .from('whatsapp_instancias').select('clinica_id')
       .eq('instance_name', instanceName).single();
 
-    console.log('[webhook] instancia:', instancia?.clinica_id || null, '| error:', supaErr?.message || null);
-
     if (!instancia) {
-      console.log(`Instância não encontrada: ${instanceName}`);
+      console.error('[webhook] Instância não encontrada:', instanceName);
       return res.sendStatus(200);
     }
 
     res.sendStatus(200);
-    console.log('[webhook] 200 enviado, iniciando processamento...');
 
     const delay = Math.floor(Math.random() * 3000) + 2000;
     await new Promise(resolve => setTimeout(resolve, delay));
-    console.log('[webhook] delay OK, chamando processarMensagem...');
+    await sendTyping(instanceName, telefone);
 
     const resposta = await processarMensagem(instancia.clinica_id, telefone, mensagem);
-    console.log('[webhook] resposta da Sofia:', resposta?.substring(0, 80));
-
     await sendMessage(instanceName, telefone, resposta);
-    console.log('[webhook] mensagem enviada com sucesso!');
 
   } catch (error) {
     console.error('Erro no webhook:', error.message);

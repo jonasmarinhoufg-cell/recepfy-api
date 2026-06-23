@@ -11,26 +11,12 @@ const evolutionClient = axios.create({
   },
 });
 
-async function checkConnectionState(instanceName) {
-  try {
-    const res = await evolutionClient.get(`/instance/connectionState/${instanceName}`);
-    return res.data;
-  } catch {
-    return null;
-  }
-}
-
 async function sendMessage(instanceName, phone, message) {
-  const state = await checkConnectionState(instanceName);
-  console.log('[sender] connectionState:', JSON.stringify(state));
-
   try {
-    console.log('[sender] POST sendText | instance:', instanceName, '| phone:', phone);
     const response = await evolutionClient.post(
       `/message/sendText/${instanceName}`,
       { number: phone, text: message }
     );
-    console.log('[sender] status:', response.data?.status, '| id:', response.data?.key?.id);
     return response.data;
   } catch (error) {
     console.error('[sender] Erro ao enviar mensagem:', error.response?.status, error.response?.data || error.message);
