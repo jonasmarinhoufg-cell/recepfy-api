@@ -28,8 +28,23 @@ app.post('/cache/invalidate', (req, res) => {
   res.sendStatus(200);
 });
 
+// Captura o último webhook recebido para diagnóstico
+const lastWebhooks = [];
+app.use('/webhooks', (req, res, next) => {
+  if (req.method === 'POST') {
+    lastWebhooks.unshift({ ts: new Date().toISOString(), body: req.body });
+    if (lastWebhooks.length > 5) lastWebhooks.pop();
+  }
+  next();
+});
+
 // Webhook do WhatsApp
 app.use('/webhooks', whatsappWebhook);
+
+// Retorna os últimos webhooks recebidos — para ver o payload real da Evolution API
+app.get('/debug/webhooks', (req, res) => {
+  res.json(lastWebhooks);
+});
 
 // Diagnóstico — testa o fluxo completo de processamento da Sofia sem enviar WhatsApp
 app.post('/debug/sofia', async (req, res) => {
