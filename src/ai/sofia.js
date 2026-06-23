@@ -205,7 +205,7 @@ async function getOrCreateConversa(clinicaId, pacienteId) {
 
   const { data: nova, error } = await supabase
     .from('conversas')
-    .insert({ clinica_id: clinicaId, paciente_id: pacienteId, status: 'ativa', canal: 'whatsapp' })
+    .insert({ clinica_id: clinicaId, paciente_id: pacienteId, status: 'ativa', iniciada_em: new Date().toISOString() })
     .select()
     .single();
 
