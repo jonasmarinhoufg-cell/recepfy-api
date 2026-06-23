@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const { processarMensagem } = require('../ai/sofia');
 const { transcribeAudioMessage } = require('../ai/transcriber');
@@ -21,14 +21,18 @@ router.post('/whatsapp', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const data = body.data;
+    // Evolution API v2 pode enviar data como array ou objeto
+    const raw = body.data;
+    const data = Array.isArray(raw) ? raw[0] : raw;
 
-    if (data.key?.fromMe) return res.sendStatus(200);
-    if (data.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
+    console.log('[webhook] fromMe:', data?.key?.fromMe, '| jid:', data?.key?.remoteJid);
+
+    if (data?.key?.fromMe) return res.sendStatus(200);
+    if (data?.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
 
     const instanceName = body.instance;
-    const telefone = data.key?.remoteJid?.replace('@s.whatsapp.net', '');
-    if (!telefone) return res.sendStatus(200);
+    const telefone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');
+    if (!telefone) { console.log('[webhook] sem telefone - jid:', data?.key?.remoteJid); return res.sendStatus(200); }
 
     const mensagem = data.message?.conversation ||
                      data.message?.extendedTextMessage?.text ||
