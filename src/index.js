@@ -21,6 +21,22 @@ app.post('/cache/invalidate', (req, res) => {
   res.sendStatus(200);
 });
 
+// Verifica e exibe a configuração atual do webhook na Evolution API
+app.get('/admin/webhook-status/:instance', async (req, res) => {
+  const evoUrl = process.env.EVOLUTION_API_URL;
+  const evoKey = process.env.EVOLUTION_API_KEY;
+  if (!evoUrl || !evoKey) return res.status(500).json({ error: 'Evolution API não configurada' });
+  try {
+    const axios = require('axios');
+    const r = await axios.get(`${evoUrl}/webhook/find/${req.params.instance}`, {
+      headers: { apikey: evoKey },
+    });
+    res.json({ ok: true, raw: r.data });
+  } catch (e) {
+    res.status(500).json({ error: e.message, status: e.response?.status, detail: e.response?.data });
+  }
+});
+
 // Reconfigura o webhook de uma instância sem recriar a conexão WhatsApp
 app.post('/admin/setup-webhook', async (req, res) => {
   const { instance_name } = req.body || {};

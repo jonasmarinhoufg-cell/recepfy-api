@@ -11,6 +11,7 @@ const supabase = createClient(
 );
 
 router.post('/whatsapp', async (req, res) => {
+  console.log('[webhook] event:', req.body?.event, '| instance:', req.body?.instance);
   try {
     const body = req.body;
 
