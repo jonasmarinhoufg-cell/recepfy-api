@@ -5,16 +5,6 @@ const { transcribeAudioMessage } = require('../ai/transcriber');
 const { sendMessage, sendTyping } = require('../whatsapp/sender');
 const { createClient } = require('@supabase/supabase-js');
 
-// Log em memória do processamento assíncrono — consultável via GET /debug/processamentos
-const processLogs = [];
-function logProc(telefone, step, detail = '') {
-  const entry = { ts: new Date().toISOString(), telefone, step, detail: String(detail).slice(0, 200) };
-  processLogs.unshift(entry);
-  if (processLogs.length > 20) processLogs.pop();
-  console.log(`[PROC] ${step} ${telefone} ${detail}`);
-}
-router.get('/processamentos', (req, res) => res.json(processLogs));
-
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -24,9 +14,7 @@ router.post('/whatsapp', async (req, res) => {
   try {
     const body = req.body;
 
-    // Evolution API v2 envia o evento como MESSAGES_UPSERT (maiúsculo) ou messages.upsert
-    const ev = (body.event || '').toUpperCase().replace('.', '_');
-    if (ev !== 'MESSAGES_UPSERT') {
+    if (body.event !== 'messages.upsert') {
       return res.sendStatus(200);
     }
 
@@ -106,38 +94,21 @@ router.post('/whatsapp', async (req, res) => {
 
     res.sendStatus(200);
 
-    logProc(telefone, 'inicio', `instancia=${instanceName} msg="${mensagem}"`);
-
     // Delay humanizado + "digitando..." para parecer humano
     const delay = Math.floor(Math.random() * 3000) + 2000;
     await new Promise(resolve => setTimeout(resolve, delay));
+    await sendTyping(instanceName, telefone);
 
-    try {
-      await sendTyping(instanceName, telefone);
-      logProc(telefone, 'typing_ok');
-    } catch (e) {
-      logProc(telefone, 'typing_erro', e.message);
-    }
+    const resposta = await processarMensagem(
+      instancia.clinica_id,
+      telefone,
+      mensagem
+    );
 
-    let resposta;
-    try {
-      resposta = await processarMensagem(instancia.clinica_id, telefone, mensagem);
-      logProc(telefone, 'sofia_ok', `resposta="${resposta?.slice(0,80)}"`);
-    } catch (e) {
-      logProc(telefone, 'sofia_erro', e.message);
-      return;
-    }
-
-    try {
-      await sendMessage(instanceName, telefone, resposta);
-      logProc(telefone, 'send_ok');
-    } catch (e) {
-      logProc(telefone, 'send_erro', e.message);
-    }
+    await sendMessage(instanceName, telefone, resposta);
 
   } catch (error) {
     console.error('Erro no webhook:', error.message);
-    logProc('?', 'webhook_erro', error.message);
   }
 });
 
