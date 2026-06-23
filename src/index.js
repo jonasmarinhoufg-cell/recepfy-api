@@ -35,6 +35,19 @@ app.use('/webhooks', whatsappWebhook);
 const { getRecentEvents } = require('./webhooks/whatsapp');
 app.get('/debug/events', (req, res) => res.json(getRecentEvents()));
 
+// Diagnóstico: busca clínica por nome e seu registro de instância WhatsApp
+app.get('/admin/clinica', async (req, res) => {
+  const { nome } = req.query;
+  if (!nome) return res.status(400).json({ error: '?nome= obrigatório' });
+  const { createClient } = require('@supabase/supabase-js');
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const { data: clinicas } = await sb.from('clinicas').select('id, nome, modalidade').ilike('nome', `%${nome}%`);
+  if (!clinicas?.length) return res.json({ encontrado: false });
+  const ids = clinicas.map(c => c.id);
+  const { data: instancias } = await sb.from('whatsapp_instancias').select('*').in('clinica_id', ids);
+  res.json({ clinicas, instancias });
+});
+
 // Lista instâncias existentes na Evolution API
 app.get('/admin/instances', async (req, res) => {
   const evoUrl = process.env.EVOLUTION_API_URL;
