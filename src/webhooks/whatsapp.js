@@ -34,8 +34,18 @@ router.post('/whatsapp', async (req, res) => {
     const telefone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');
     if (!telefone) { console.log('[webhook] sem telefone - jid:', data?.key?.remoteJid); return res.sendStatus(200); }
 
-    const mensagem = data.message?.conversation ||
-                     data.message?.extendedTextMessage?.text ||
+    console.log('[webhook] message keys:', JSON.stringify(Object.keys(data?.message || {})));
+
+    // Extrai texto de todos os tipos comuns de mensagem de texto
+    const mensagem = data?.message?.conversation ||
+                     data?.message?.extendedTextMessage?.text ||
+                     data?.message?.imageMessage?.caption ||
+                     data?.message?.videoMessage?.caption ||
+                     data?.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+                     data?.message?.ephemeralMessage?.message?.conversation ||
+                     data?.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+                     data?.message?.viewOnceMessage?.message?.conversation ||
+                     data?.message?.viewOnceMessage?.message?.extendedTextMessage?.text ||
                      '';
 
     // Áudio (voz ou arquivo de áudio) — transcreve com Whisper
@@ -69,6 +79,7 @@ router.post('/whatsapp', async (req, res) => {
 
     // Outros mídia (imagem, vídeo, documento, sticker) — pede para digitar
     if (!mensagem) {
+      console.log('[webhook] mensagem vazia - keys:', JSON.stringify(Object.keys(data?.message || {})));
       const temMidia = data.message && (
         data.message.imageMessage    ||
         data.message.videoMessage    ||
