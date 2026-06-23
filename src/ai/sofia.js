@@ -399,6 +399,27 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     const agendamentoRecente = await getAgendamentoRecente(clinicaId, paciente.id);
     const perfilPaciente = buildPerfilPaciente(paciente, agendamentoRecente);
 
+    // 2a. Handoff pendente: se o paciente foi encaminhado nas últimas 24h, não responde com IA
+    const { data: handoffAtivo } = await supabase
+      .from('conversas')
+      .select('id')
+      .eq('clinica_id', clinicaId)
+      .eq('paciente_id', paciente.id)
+      .eq('resolucao', 'handoff')
+      .eq('status', 'encerrada')
+      .gte('encerrada_em', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+      .order('encerrada_em', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (handoffAtivo) {
+      const conversa = await getOrCreateConversa(clinicaId, paciente.id);
+      await salvarMensagem(conversa.id, 'user', mensagem);
+      const holdMsg = 'Nossa equipe vai te atender em breve. 🙏';
+      await salvarMensagem(conversa.id, 'assistant', holdMsg);
+      return holdMsg;
+    }
+
     // 3. Conversa ativa (ou nova se passaram mais de 2h)
     const conversa = await getOrCreateConversa(clinicaId, paciente.id);
 
@@ -443,14 +464,15 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       await encerrarConversa(conversa.id, 'ia');
     }
 
-    // 11. Handoff — encerra e notifica
+    // 11. Handoff — encerra com resolucao 'handoff' e notifica
     if (parsed.handoff) {
-      await encerrarConversa(conversa.id, 'humano');
+      await encerrarConversa(conversa.id, 'handoff');
+      const nomePaciente = paciente.nome || telefone;
       await supabase.from('notificacoes').insert({
         clinica_id: clinicaId,
         tipo: 'handoff',
         titulo: 'Paciente precisa de atendimento humano',
-        corpo: `Telefone: ${telefone} — "${mensagem}"`,
+        corpo: `${nomePaciente} (${telefone}) — "${mensagem}"`,
       });
     }
 
