@@ -13,13 +13,15 @@ const evolutionClient = axios.create({
 
 async function sendMessage(instanceName, phone, message) {
   try {
+    console.log('[sender] POST sendText | instance:', instanceName, '| phone:', phone, '| EVOLUTION_URL:', EVOLUTION_URL ? 'OK' : 'AUSENTE');
     const response = await evolutionClient.post(
       `/message/sendText/${instanceName}`,
       { number: phone, text: message }
     );
+    console.log('[sender] resposta Evolution:', JSON.stringify(response.data).substring(0, 200));
     return response.data;
   } catch (error) {
-    console.error('Erro ao enviar mensagem:', error.message);
+    console.error('[sender] Erro ao enviar mensagem:', error.response?.status, error.response?.data || error.message);
     throw error;
   }
 }
