@@ -14,7 +14,9 @@ router.post('/whatsapp', async (req, res) => {
   try {
     const body = req.body;
 
-    if (body.event !== 'messages.upsert') {
+    // Evolution API v2 envia MESSAGES_UPSERT (maiúsculo) ou messages.upsert
+    const ev = (body.event || '').toUpperCase().replace('.', '_');
+    if (ev !== 'MESSAGES_UPSERT') {
       return res.sendStatus(200);
     }
 
