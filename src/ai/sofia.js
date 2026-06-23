@@ -151,6 +151,7 @@ function buildPerfilPaciente(paciente, agendamentoRecente) {
 
   if (agendamentoRecente?.status === 'confirmado') {
     perfil += `\nINSTRUÇÃO: Este paciente tem consulta agendada. Se perguntar, confirme os dados acima. Se quiser cancelar, siga o fluxo de cancelamento.`;
+    perfil += `\nINSTRUÇÃO: Se o paciente quiser mudar o horário, use o FLUXO DE REAGENDAMENTO, não o de cancelamento.`;
   }
 
   return perfil;
@@ -265,6 +266,40 @@ async function cancelarAgendamento(clinicaId, pacienteId) {
   }
 
   return true;
+}
+
+async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade) {
+  // Busca o próximo agendamento confirmado/reagendado do paciente
+  const { data: agendamentoAtual } = await supabase
+    .from('agendamentos')
+    .select('id, medico_id, data_hora')
+    .eq('clinica_id', clinicaId)
+    .eq('paciente_id', pacienteId)
+    .in('status', ['confirmado', 'reagendado'])
+    .gte('data_hora', new Date().toISOString())
+    .order('data_hora', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  // Cancela o agendamento atual, se existir
+  if (agendamentoAtual) {
+    await supabase.from('agendamentos')
+      .update({ status: 'cancelado' })
+      .eq('id', agendamentoAtual.id);
+  }
+
+  // Salva o novo agendamento
+  await salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade);
+
+  // Notificação de reagendamento
+  const medicoId = agendamentoAtual?.medico_id || null;
+  await supabase.from('notificacoes').insert({
+    clinica_id: clinicaId,
+    ...(medicoId ? { medico_id: medicoId } : {}),
+    tipo:   'agendamento',
+    titulo: 'Consulta reagendada pela Sofia',
+    corpo:  `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`,
+  });
 }
 
 async function encerrarConversa(conversaId, resolucao = 'ia') {
@@ -402,7 +437,13 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       await encerrarConversa(conversa.id, 'ia');
     }
 
-    // 10. Handoff — encerra e notifica
+    // 10. Reagendamento confirmado
+    if (parsed.reagendamento) {
+      await reagendarAgendamento(clinicaId, paciente.id, conversa.id, parsed.reagendamento, modalidade);
+      await encerrarConversa(conversa.id, 'ia');
+    }
+
+    // 11. Handoff — encerra e notifica
     if (parsed.handoff) {
       await encerrarConversa(conversa.id, 'humano');
       await supabase.from('notificacoes').insert({

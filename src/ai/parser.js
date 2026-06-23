@@ -2,10 +2,11 @@
 
 function parseResponse(text) {
   const result = {
-    message:     text,
-    booking:     null,
+    message:      text,
+    booking:      null,
     cancelamento: false,
-    handoff:     false,
+    reagendamento: null,
+    handoff:      false,
   };
 
   // Agendamento confirmado
@@ -16,6 +17,17 @@ function parseResponse(text) {
       result.message = text.replace(/\[AGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
     } catch (e) {
       console.error('Erro ao parsear agendamento:', e.message);
+    }
+  }
+
+  // Reagendamento confirmado
+  const reagendamentoMatch = text.match(/\[REAGENDAMENTO_CONFIRMADO:(.*?)\]/s);
+  if (reagendamentoMatch) {
+    try {
+      result.reagendamento = JSON.parse(reagendamentoMatch[1]);
+      result.message = text.replace(/\[REAGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+    } catch (e) {
+      console.error('Erro ao parsear reagendamento:', e.message);
     }
   }
 
