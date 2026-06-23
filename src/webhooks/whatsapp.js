@@ -16,22 +16,34 @@ router.post('/whatsapp', async (req, res) => {
 
     // Evolution API v2 envia MESSAGES_UPSERT (maiúsculo) ou messages.upsert
     const ev = (body.event || '').toUpperCase().replace('.', '_');
+    console.log(`[WH] event="${body.event}" ev="${ev}" instance="${body.instance}"`);
     if (ev !== 'MESSAGES_UPSERT') {
       return res.sendStatus(200);
     }
 
     const data = body.data;
 
-    if (data.key?.fromMe) return res.sendStatus(200);
-    if (data.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
+    if (data.key?.fromMe) {
+      console.log('[WH] ignorado: fromMe');
+      return res.sendStatus(200);
+    }
+    if (data.key?.remoteJid?.includes('@g.us')) {
+      console.log('[WH] ignorado: grupo');
+      return res.sendStatus(200);
+    }
 
     const instanceName = body.instance;
     const telefone = data.key?.remoteJid?.replace('@s.whatsapp.net', '');
-    if (!telefone) return res.sendStatus(200);
+    if (!telefone) {
+      console.log('[WH] ignorado: sem telefone. remoteJid=' + data.key?.remoteJid);
+      return res.sendStatus(200);
+    }
 
     const mensagem = data.message?.conversation ||
                      data.message?.extendedTextMessage?.text ||
                      '';
+
+    console.log(`[WH] fone=${telefone} msg="${mensagem.slice(0,60)}" msgKeys=${Object.keys(data.message || {}).join(',')}`);
 
     // Áudio (voz ou arquivo de áudio) — transcreve com Whisper
     const temAudio = data.message?.audioMessage || data.message?.pttMessage;
@@ -81,6 +93,8 @@ router.post('/whatsapp', async (req, res) => {
             'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?'
           );
         }
+      } else {
+        console.log('[WH] ignorado: sem mensagem e sem midia reconhecida');
       }
       return;
     }
@@ -90,10 +104,11 @@ router.post('/whatsapp', async (req, res) => {
       .eq('instance_name', instanceName).single();
 
     if (!instancia) {
-      console.log(`Instância não encontrada: ${instanceName}`);
+      console.log(`[WH] instância não encontrada: ${instanceName}`);
       return res.sendStatus(200);
     }
 
+    console.log(`[WH] processando: clinica=${instancia.clinica_id}`);
     res.sendStatus(200);
 
     // Delay humanizado + "digitando..." para parecer humano
@@ -107,10 +122,12 @@ router.post('/whatsapp', async (req, res) => {
       mensagem
     );
 
+    console.log(`[WH] resposta gerada (${resposta?.length} chars), enviando...`);
     await sendMessage(instanceName, telefone, resposta);
+    console.log('[WH] enviado com sucesso');
 
   } catch (error) {
-    console.error('Erro no webhook:', error.message);
+    console.error('[WH] erro:', error.message);
   }
 });
 
