@@ -32,6 +32,24 @@ app.post('/cache/invalidate', (req, res) => {
 app.use('/webhooks', whatsappWebhook);
 
 
+// Verifica estado REAL da conexão e testa envio de mensagem
+app.get('/admin/check/:instance', async (req, res) => {
+  const evoUrl = process.env.EVOLUTION_API_URL;
+  const evoKey = process.env.EVOLUTION_API_KEY;
+  const { instance } = req.params;
+  if (!evoUrl || !evoKey) return res.status(500).json({ error: 'Evolution API não configurada' });
+  try {
+    const axios = require('axios');
+    const [stateRes, webhookRes] = await Promise.all([
+      axios.get(`${evoUrl}/instance/connectionState/${instance}`, { headers: { apikey: evoKey } }).catch(e => ({ data: { error: e.message } })),
+      axios.get(`${evoUrl}/webhook/find/${instance}`, { headers: { apikey: evoKey } }).catch(e => ({ data: { error: e.message } })),
+    ]);
+    res.json({ connectionState: stateRes.data, webhook: webhookRes.data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Reconfigura o webhook de uma instância na Evolution API
 // Usado para corrigir instâncias que perderam o webhook sem recriar a conexão
 app.post('/admin/setup-webhook', async (req, res) => {
