@@ -33,18 +33,18 @@ router.post('/whatsapp', async (req, res) => {
     const data = body.data;
 
     if (data.key?.fromMe) {
-      console.log('[WH] ignorado: fromMe');
+      logEvent({ step: 'ignorado_fromMe', instance: body.instance });
       return res.sendStatus(200);
     }
     if (data.key?.remoteJid?.includes('@g.us')) {
-      console.log('[WH] ignorado: grupo');
+      logEvent({ step: 'ignorado_grupo', jid: data.key.remoteJid });
       return res.sendStatus(200);
     }
 
     const instanceName = body.instance;
     const telefone = data.key?.remoteJid?.replace('@s.whatsapp.net', '');
     if (!telefone) {
-      console.log('[WH] ignorado: sem telefone. remoteJid=' + data.key?.remoteJid);
+      logEvent({ step: 'ignorado_sem_telefone', remoteJid: data.key?.remoteJid });
       return res.sendStatus(200);
     }
 
@@ -52,7 +52,9 @@ router.post('/whatsapp', async (req, res) => {
                      data.message?.extendedTextMessage?.text ||
                      '';
 
-    console.log(`[WH] fone=${telefone} msg="${mensagem.slice(0,60)}" msgKeys=${Object.keys(data.message || {}).join(',')}`);
+    const msgKeys = Object.keys(data.message || {}).join(',');
+    logEvent({ step: 'recebido', instance: instanceName, telefone, mensagem: mensagem.slice(0, 80), msgKeys });
+    console.log(`[WH] fone=${telefone} msg="${mensagem.slice(0,60)}" msgKeys=${msgKeys}`);
 
     // Áudio (voz ou arquivo de áudio) — transcreve com Whisper
     const temAudio = data.message?.audioMessage || data.message?.pttMessage;
