@@ -32,6 +32,25 @@ app.post('/cache/invalidate', (req, res) => {
 app.use('/webhooks', whatsappWebhook);
 
 
+// Envia mensagem de teste e retorna resposta completa da Evolution API
+app.post('/admin/test-send', async (req, res) => {
+  const { instance_name, number, text = 'Teste Sofia ✅' } = req.body || {};
+  if (!instance_name || !number) return res.status(400).json({ error: 'instance_name e number obrigatórios' });
+  const evoUrl = process.env.EVOLUTION_API_URL;
+  const evoKey = process.env.EVOLUTION_API_KEY;
+  try {
+    const axios = require('axios');
+    const response = await axios.post(
+      `${evoUrl}/message/sendText/${instance_name}`,
+      { number, text },
+      { headers: { apikey: evoKey, 'Content-Type': 'application/json' } }
+    );
+    res.json({ ok: true, status: response.status, data: response.data });
+  } catch (e) {
+    res.status(500).json({ ok: false, status: e.response?.status, error: e.message, data: e.response?.data });
+  }
+});
+
 // Verifica estado REAL da conexão e testa envio de mensagem
 app.get('/admin/check/:instance', async (req, res) => {
   const evoUrl = process.env.EVOLUTION_API_URL;
