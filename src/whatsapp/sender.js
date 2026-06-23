@@ -39,7 +39,11 @@ async function sendMessage(instanceName, phone, message) {
     console.log('[sender] POST sendText | instance:', instanceName, '| phone:', normalized);
     const response = await evolutionClient.post(
       `/message/sendText/${instanceName}`,
-      { number: normalized, text: message }
+      {
+        number: normalized,
+        options: { delay: 1200, presence: 'composing' },
+        textMessage: { text: message },
+      }
     );
     console.log('[sender] resposta Evolution:', JSON.stringify(response.data).substring(0, 200));
     return response.data;
