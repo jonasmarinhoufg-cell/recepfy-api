@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 
 const whatsappWebhook = require('./webhooks/whatsapp');
+const { invalidateCache } = require('./ai/sofia');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,6 +18,14 @@ app.get('/', (req, res) => {
     message: 'Recepfy API funcionando!',
     version: '1.0.0'
   });
+});
+
+// Invalida cache de configuração de uma clínica
+// Chamado pelo painel web após salvar configs da Sofia
+app.post('/cache/invalidate', (req, res) => {
+  const { clinica_id } = req.body || {};
+  if (clinica_id) invalidateCache(clinica_id);
+  res.sendStatus(200);
 });
 
 // Webhook do WhatsApp
