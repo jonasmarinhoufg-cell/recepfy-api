@@ -1,7 +1,15 @@
 const { OpenAI, toFile } = require('openai');
 const axios = require('axios');
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Inicialização lazy — não quebra o módulo se a chave ainda não estiver configurada
+let _openai = null;
+function getOpenAI() {
+  if (!_openai) {
+    if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY não configurada no Railway')
+    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  }
+  return _openai
+}
 
 // Baixa o áudio da Evolution API como base64 e transcreve com Whisper
 async function transcribeAudioMessage(instanceName, messageKey, messageContent) {
@@ -27,7 +35,7 @@ async function transcribeAudioMessage(instanceName, messageKey, messageContent) 
 
   const file = await toFile(buffer, `audio.${ext}`, { type: mimetype });
 
-  const transcription = await openai.audio.transcriptions.create({
+  const transcription = await getOpenAI().audio.transcriptions.create({
     file,
     model: 'whisper-1',
     language: 'pt',
