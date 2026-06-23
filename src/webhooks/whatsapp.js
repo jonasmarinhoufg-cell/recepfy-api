@@ -101,9 +101,14 @@ router.post('/whatsapp', async (req, res) => {
       return;
     }
 
-    const { data: instancia } = await supabase
+    console.log('[webhook] mensagem extraída:', mensagem.substring(0, 80));
+    console.log('[webhook] buscando instancia:', instanceName, '| SUPABASE_URL:', process.env.SUPABASE_URL ? 'OK' : 'AUSENTE');
+
+    const { data: instancia, error: supaErr } = await supabase
       .from('whatsapp_instancias').select('clinica_id')
       .eq('instance_name', instanceName).single();
+
+    console.log('[webhook] instancia:', instancia?.clinica_id || null, '| error:', supaErr?.message || null);
 
     if (!instancia) {
       console.log(`Instância não encontrada: ${instanceName}`);
