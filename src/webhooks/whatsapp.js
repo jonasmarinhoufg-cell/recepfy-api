@@ -10,6 +10,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// Deduplicação: evita reprocessar o mesmo evento enviado duas vezes pela Evolution API
+const processedMessageIds = new Set();
+
 router.post('/whatsapp', async (req, res) => {
   try {
     const body = req.body;
@@ -25,6 +28,17 @@ router.post('/whatsapp', async (req, res) => {
 
     if (data?.key?.fromMe) return res.sendStatus(200);
     if (data?.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
+
+    // Ignora mensagem já processada (Evolution pode disparar o mesmo evento duas vezes)
+    const messageId = data?.key?.id;
+    if (messageId) {
+      if (processedMessageIds.has(messageId)) {
+        console.log('[webhook] Mensagem duplicada ignorada:', messageId);
+        return res.sendStatus(200);
+      }
+      processedMessageIds.add(messageId);
+      setTimeout(() => processedMessageIds.delete(messageId), 5 * 60 * 1000);
+    }
 
     const instanceName = body.instance;
     const telefone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');

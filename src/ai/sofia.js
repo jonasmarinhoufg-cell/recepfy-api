@@ -504,9 +504,10 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
     const perguntaSobreMedico = /médico|prefere|escolh|consultar|especialista|profissional|qual.*quer|qual.*deseja|qual.*indica/i.test(prevTexto);
     const medicos = config.medicos || [];
 
+    // Verifica qualquer parte do nome (não só o primeiro nome) para capturar "Dr. Silva", "Dra. Ana" etc.
     const match = medicos.find(m => {
-      const primeiroNome = m.nome.toLowerCase().split(' ')[0];
-      return texto.includes(primeiroNome);
+      const partes = m.nome.toLowerCase().split(' ').filter(p => p.length > 2);
+      return partes.some(parte => texto.includes(parte));
     });
 
     if (match) {
@@ -583,8 +584,19 @@ function extrairEstadoConversa(historico, mensagemAtual, paciente, config) {
   return estado;
 }
 
-function buildEstadoInjetado(estado, config) {
+function buildEstadoInjetado(estado, config, mensagemAtual = '') {
   const isProf = config.clinica?.modalidade === 'profissional';
+
+  // Só ativa o fluxo de agendamento se já há dados coletados nesta conversa
+  // OU se a mensagem atual tem intenção explícita de agendar.
+  // Motivo e horário nunca vêm do perfil, então sua presença indica fluxo em andamento.
+  const fluxoIniciado = !!(estado.motivo || estado.horario);
+  const temIntencao = /\bagend|\bmarcar\b|\bconsult[ae]\b|\bhorário\b|\bquero\s+(uma?\s+)?consulta/i.test(mensagemAtual);
+
+  if (!fluxoIniciado && !temIntencao) {
+    return '\n\n=== MODO DE ATENDIMENTO ===\nNenhum agendamento em andamento. Responda a dúvida ou saudação do paciente normalmente, sem iniciar coleta de dados de agendamento a menos que ele solicite.\n===========================';
+  }
+
   const linhas = ['\n\n=== ESTADO ATUAL DO AGENDAMENTO ==='];
   linhas.push('(Calculado do histórico — NÃO repita perguntas para itens com ✓)\n');
 
@@ -668,7 +680,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     // 4a. Extrai estado atual da conversa em código (evita loop de perguntas)
     // mensagem é passada para incluir a resposta atual no estado (ela ainda não está no histórico)
     const estadoConversa = extrairEstadoConversa(historico, mensagem, paciente, config);
-    const estadoInjetado = buildEstadoInjetado(estadoConversa, config);
+    const estadoInjetado = buildEstadoInjetado(estadoConversa, config, mensagem);
 
     // Log para debug no Railway — mostra o estado calculado antes de chamar Claude
     console.log(`[SOFIA] clinica=${clinicaId} tel=${telefone} estado=${JSON.stringify(estadoConversa)}`);
