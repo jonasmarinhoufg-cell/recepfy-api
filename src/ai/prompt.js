@@ -67,25 +67,41 @@ function buildPrompt(config, perfilPaciente = '') {
     : 'Nenhuma pergunta frequente cadastrada ainda';
 
   // ── Horários disponíveis ───────────────────────────────────────────────────
-  // Agrupa por data para facilitar a leitura da IA
+  // Para profissional: agrupa por data. Para clínica: agrupa por médico → data
+  // (paciente escolhe o médico primeiro, depois vê os slots daquele médico)
   const horariosFormatados = horarios.length > 0
     ? (() => {
-        const porData = {};
-        horarios.forEach(h => {
-          const opts = { timeZone: 'America/Sao_Paulo' };
-          const data = new Date(h.data_hora).toLocaleDateString('pt-BR', {
-            ...opts, weekday: 'long', day: '2-digit', month: '2-digit',
+        const opts = { timeZone: 'America/Sao_Paulo' };
+        if (isProf) {
+          const porData = {};
+          horarios.forEach(h => {
+            const data = new Date(h.data_hora).toLocaleDateString('pt-BR', { ...opts, weekday: 'long', day: '2-digit', month: '2-digit' });
+            const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', { ...opts, hour: '2-digit', minute: '2-digit' });
+            if (!porData[data]) porData[data] = [];
+            porData[data].push(hora);
           });
-          const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', {
-            ...opts, hour: '2-digit', minute: '2-digit',
+          return Object.entries(porData)
+            .map(([data, horas]) => `${data}: ${horas.join(', ')}`)
+            .join('\n');
+        } else {
+          const porMedico = {};
+          horarios.forEach(h => {
+            const medico = h.medico_nome || 'Médico';
+            const data = new Date(h.data_hora).toLocaleDateString('pt-BR', { ...opts, weekday: 'long', day: '2-digit', month: '2-digit' });
+            const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', { ...opts, hour: '2-digit', minute: '2-digit' });
+            if (!porMedico[medico]) porMedico[medico] = {};
+            if (!porMedico[medico][data]) porMedico[medico][data] = [];
+            porMedico[medico][data].push(hora);
           });
-          const medico = isProf ? (clinica.medico_nome || 'o médico') : (h.medico_nome || 'médico');
-          if (!porData[data]) porData[data] = [];
-          porData[data].push(`${hora} com ${medico}`);
-        });
-        return Object.entries(porData)
-          .map(([data, horas]) => `${data}: ${horas.join(', ')}`)
-          .join('\n');
+          return Object.entries(porMedico)
+            .map(([medico, porData]) => {
+              const dias = Object.entries(porData)
+                .map(([data, horas]) => `  ${data}: ${horas.join(', ')}`)
+                .join('\n');
+              return `${medico}:\n${dias}`;
+            })
+            .join('\n\n');
+        }
       })()
     : `Sem horários cadastrados no momento — informe o paciente e sugira ${isProf ? 'ligar para o consultório' : 'ligar para a clínica'}: ${clinica.telefone || 'número não informado'}`;
 
@@ -122,17 +138,22 @@ ${faqsText}
 AVISOS:
 ${avisosText}
 
-FLUXO DE AGENDAMENTO — SIGA ESSA ORDEM SEM PULAR ETAPAS:
-1. Verifique o PERFIL DO PACIENTE acima — se já tem nome, NÃO pergunte de novo
-2. Se não souber o nome: pergunte uma única vez
-3. Assim que receber o nome, avance imediatamente para o motivo
-4. Pergunte o motivo da consulta de forma simples e direta, sem dar exemplos
-5. Se o paciente não entender "motivo", explique: pode ser o que está sentindo ou o tipo de consulta
-6. Se o convênio não estiver no perfil, pergunte qual convênio ele usa (ou se é particular)
-7. Apresente os horários usando o modelo de formatação abaixo
-8. Confirme os dados usando o modelo de confirmação abaixo
-9. Ao receber confirmação do paciente, inclua OBRIGATORIAMENTE ao final:
-   [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]
+${isProf ? `FLUXO DE AGENDAMENTO — COLETE ESSES DADOS NA ORDEM ABAIXO, PULANDO OS QUE JÁ FORAM INFORMADOS NESSA CONVERSA OU NO PERFIL:
+1. NOME — se não está no perfil e não apareceu nessa conversa: pergunte uma única vez
+2. MOTIVO — se o paciente não descreveu ainda nessa conversa: pergunte de forma direta. Qualquer descrição de sintoma ou tipo de consulta conta
+3. CONVÊNIO — se não está no perfil e o paciente não mencionou ainda nessa conversa: pergunte se usa convênio ou é particular
+4. HORÁRIOS — apresente os horários disponíveis usando o modelo de formatação abaixo
+5. CONFIRMAÇÃO — confirme os dados coletados usando o modelo abaixo
+6. Ao receber confirmação, inclua OBRIGATORIAMENTE ao final:
+   [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]` : `FLUXO DE AGENDAMENTO — COLETE ESSES DADOS NA ORDEM ABAIXO, PULANDO OS QUE JÁ FORAM INFORMADOS NESSA CONVERSA OU NO PERFIL:
+1. NOME — se não está no perfil e não apareceu nessa conversa: pergunte uma única vez
+2. MOTIVO — se o paciente não descreveu ainda nessa conversa: pergunte de forma direta. Qualquer descrição de sintoma ou tipo de consulta conta
+3. MÉDICO — apresente os médicos disponíveis e pergunte com qual prefere consultar (use as especialidades para ajudar). Se já escolheu nessa conversa: pule
+4. HORÁRIOS — apresente APENAS os horários do médico escolhido
+5. CONVÊNIO — se não está no perfil e o paciente não mencionou ainda nessa conversa: pergunte se usa convênio ou é particular
+6. CONFIRMAÇÃO — confirme os dados coletados usando o modelo abaixo
+7. Ao receber confirmação, inclua OBRIGATORIAMENTE ao final:
+   [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]`}
 
 FLUXO DE CANCELAMENTO:
 - Se o paciente quiser cancelar uma consulta, verifique o PERFIL DO PACIENTE
@@ -148,12 +169,14 @@ FLUXO DE REAGENDAMENTO:
 - Ao receber confirmação, inclua OBRIGATORIAMENTE ao final:
   [REAGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]
 
-REGRAS ANTI-LOOP — CRÍTICO:
-- Analise o histórico COMPLETO antes de qualquer resposta
-- Se já tem o nome nessa conversa ou no perfil, NÃO peça de novo
-- Se já tem o motivo, vá direto para o convênio (se não souber) ou para os horários
-- Se já tem o convênio no perfil, não pergunte de novo
-- Nunca repita a mesma pergunta duas vezes seguidas
+REGRAS ANTI-LOOP — LEIA ANTES DE CADA RESPOSTA — CRÍTICO:
+- Leia todo o histórico desta conversa (últimas 20 mensagens) antes de qualquer resposta
+- NOME: se apareceu em qualquer mensagem anterior OU está no perfil → NÃO peça de novo
+- MOTIVO: se o paciente descreveu um sintoma, tipo de consulta ou razão em qualquer mensagem desta conversa → NÃO peça de novo. "Dor nas costas", "retorno", "check-up", qualquer descrição conta como motivo válido
+- CONVÊNIO: se o paciente mencionou "particular", nome de plano ou "sem convênio" em qualquer mensagem desta conversa OU está no perfil → NÃO peça de novo
+- MÉDICO: se foi escolhido nessa conversa → NÃO pergunte de novo
+- Nunca faça a mesma pergunta duas vezes. Se o paciente respondeu, AVANCE imediatamente para o próximo dado que ainda falta
+- O histórico de consultas anteriores NÃO pré-seleciona o médico — em cada novo agendamento sempre pergunte qual prefere
 - Após confirmar o agendamento ou cancelamento, encerre com uma frase de despedida natural
 
 HANDOFF:
