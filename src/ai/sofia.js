@@ -486,7 +486,57 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
 // Analisa o histórico em código (determinístico) para saber o que já foi coletado.
 // Injeta o estado no prompt para que Claude não repita perguntas.
 
-function extrairEstadoConversa(historico, paciente, config) {
+function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
+  const texto = conteudo.toLowerCase();
+
+  // Nome: resposta após pergunta de nome
+  if (!estado.nome && /nome|chama/i.test(prevTexto) && conteudo.length < 80) {
+    estado.nome = conteudo;
+  }
+
+  // Motivo: resposta após pergunta de motivo/consulta
+  if (!estado.motivo && /motivo|consulta|trazendo|sentindo|queixa/i.test(prevTexto)) {
+    estado.motivo = conteudo;
+  }
+
+  // Médico (apenas clinica): resposta após lista de médicos OU menção direta com contexto
+  if (!isProf && !estado.medico) {
+    const perguntaSobreMedico = /médico|prefere|escolh|consultar|especialista|profissional/i.test(prevTexto);
+    const medicos = config.medicos || [];
+
+    const match = medicos.find(m => {
+      const primeiroNome = m.nome.toLowerCase().split(' ')[0];
+      return texto.includes(primeiroNome);
+    });
+
+    if (match && (perguntaSobreMedico || /\b(com|dr\.?|dra\.?)\b/i.test(texto) || conteudo.length < 40)) {
+      estado.medico = match.nome;
+    } else if (perguntaSobreMedico && !match && conteudo.length < 50) {
+      // Fallback: paciente respondeu à pergunta mas não mencionou nome reconhecível
+      estado.medico = conteudo;
+    }
+  }
+
+  // Horário: resposta com número após pergunta de horário OU após mensagem com lista de datas/horas
+  if (!estado.horario) {
+    const prevTemPerguntaHora = /horário|quando|data|hora/i.test(prevTexto);
+    const prevTemListaHora   = /\d{1,2}:\d{2}|\d{2}\/\d{2}|segunda|terça|quarta|quinta|sexta/i.test(prevTexto);
+    if ((prevTemPerguntaHora || prevTemListaHora) && /\d/.test(conteudo)) {
+      estado.horario = conteudo;
+    }
+  }
+
+  // Convênio: menção direta OU resposta após pergunta de convênio
+  if (!estado.convenio) {
+    if (/particular/i.test(texto) || /sem conv[eê]nio/i.test(texto)) {
+      estado.convenio = 'Particular';
+    } else if (/conv[eê]nio|plano/i.test(prevTexto) && conteudo.length < 60) {
+      estado.convenio = conteudo;
+    }
+  }
+}
+
+function extrairEstadoConversa(historico, mensagemAtual, paciente, config) {
   const isProf = config.clinica?.modalidade === 'profissional';
 
   const estado = {
@@ -497,14 +547,13 @@ function extrairEstadoConversa(historico, paciente, config) {
     convenio: paciente?.convenio || null,
   };
 
+  // Itera o histórico buscando pares pergunta→resposta
   for (let i = 0; i < historico.length; i++) {
     const msg = historico[i];
     if (msg.role !== 'user') continue;
-
     const conteudo = (msg.content || '').trim();
     if (!conteudo) continue;
 
-    // Última mensagem do assistente antes desta
     let prevTexto = '';
     for (let j = i - 1; j >= 0; j--) {
       if (historico[j].role === 'assistant') {
@@ -512,41 +561,14 @@ function extrairEstadoConversa(historico, paciente, config) {
         break;
       }
     }
+    _aplicarMensagem(estado, conteudo, prevTexto, isProf, config);
+  }
 
-    const texto = conteudo.toLowerCase();
-
-    // Nome: resposta após pergunta de nome
-    if (!estado.nome && /nome|chama/i.test(prevTexto) && conteudo.length < 80) {
-      estado.nome = conteudo;
-    }
-
-    // Motivo: resposta após pergunta de motivo/consulta
-    if (!estado.motivo && /motivo|consulta|trazendo|sentindo|queixa/i.test(prevTexto)) {
-      estado.motivo = conteudo;
-    }
-
-    // Médico (apenas clinica): resposta após lista de médicos
-    if (!isProf && !estado.medico && /médico|prefere|escolh|consultar com/i.test(prevTexto)) {
-      const match = (config.medicos || []).find(m => {
-        const primeiroNome = m.nome.toLowerCase().split(' ')[0];
-        return texto.includes(primeiroNome) || primeiroNome.includes(texto.split(' ')[0]);
-      });
-      estado.medico = match ? match.nome : conteudo;
-    }
-
-    // Horário: resposta numérica após pergunta de horário
-    if (!estado.horario && /horário|quando|data|hora/i.test(prevTexto) && /\d/.test(conteudo)) {
-      estado.horario = conteudo;
-    }
-
-    // Convênio: menção direta ou resposta após pergunta de convênio
-    if (!estado.convenio) {
-      if (/particular/i.test(texto) || /sem conv[eê]nio/i.test(texto)) {
-        estado.convenio = 'Particular';
-      } else if (/conv[eê]nio|plano/i.test(prevTexto)) {
-        estado.convenio = conteudo;
-      }
-    }
+  // Inclui a mensagem atual no estado (ela ainda não foi salva no histórico)
+  if (mensagemAtual?.trim()) {
+    const ultimaAssist = [...historico].reverse().find(m => m.role === 'assistant');
+    const prevTexto = (ultimaAssist?.content || '').toLowerCase();
+    _aplicarMensagem(estado, mensagemAtual.trim(), prevTexto, isProf, config);
   }
 
   return estado;
@@ -635,7 +657,8 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     const historico = await getHistorico(conversa.id);
 
     // 4a. Extrai estado atual da conversa em código (evita loop de perguntas)
-    const estadoConversa = extrairEstadoConversa(historico, paciente, config);
+    // mensagem é passada para incluir a resposta atual no estado (ela ainda não está no histórico)
+    const estadoConversa = extrairEstadoConversa(historico, mensagem, paciente, config);
     const estadoInjetado = buildEstadoInjetado(estadoConversa, config);
 
     // 5. Salva mensagem do paciente ANTES de processar
