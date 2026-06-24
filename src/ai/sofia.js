@@ -180,7 +180,7 @@ async function getAgendamentoRecente(clinicaId, pacienteId) {
     .select('*, medicos(nome)')
     .eq('clinica_id', clinicaId)
     .eq('paciente_id', pacienteId)
-    .in('status', ['confirmado', 'reagendado'])
+    .eq('status', 'confirmado')
     .gte('data_hora', trintaDiasAtras)
     .order('data_hora', { ascending: true })
     .limit(1)
@@ -255,7 +255,7 @@ async function cancelarAgendamento(clinicaId, pacienteId) {
     .select('id, medico_id, data_hora')
     .eq('clinica_id', clinicaId)
     .eq('paciente_id', pacienteId)
-    .in('status', ['confirmado', 'reagendado'])
+    .eq('status', 'confirmado')
     .gte('data_hora', new Date().toISOString())
     .order('data_hora', { ascending: true })
     .limit(1)
@@ -266,6 +266,15 @@ async function cancelarAgendamento(clinicaId, pacienteId) {
   await supabase.from('agendamentos')
     .update({ status: 'cancelado' })
     .eq('id', data.id);
+
+  // B1 — Libera o slot para outros pacientes poderem agendar
+  if (data.medico_id) {
+    await supabase.from('horarios_disponiveis')
+      .update({ disponivel: true })
+      .eq('clinica_id', clinicaId)
+      .eq('data_hora', data.data_hora)
+      .eq('medico_id', data.medico_id);
+  }
 
   // Notifica a clínica
   if (data.medico_id) {
@@ -282,13 +291,13 @@ async function cancelarAgendamento(clinicaId, pacienteId) {
 }
 
 async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, pacienteTelefone = null) {
-  // Busca o próximo agendamento confirmado/reagendado do paciente
+  // Busca o próximo agendamento confirmado do paciente
   const { data: agendamentoAtual } = await supabase
     .from('agendamentos')
     .select('id, medico_id, data_hora')
     .eq('clinica_id', clinicaId)
     .eq('paciente_id', pacienteId)
-    .in('status', ['confirmado', 'reagendado'])
+    .eq('status', 'confirmado')
     .gte('data_hora', new Date().toISOString())
     .order('data_hora', { ascending: true })
     .limit(1)
@@ -298,7 +307,7 @@ async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, 
     ? formatBRT(agendamentoAtual.data_hora, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
     : null;
 
-  // Cancela o agendamento atual e libera o slot
+  // Cancela o agendamento atual e libera o slot (tentativo — restauramos se o novo falhar)
   if (agendamentoAtual) {
     await supabase.from('agendamentos')
       .update({ status: 'cancelado' })
@@ -311,8 +320,24 @@ async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, 
       .eq('medico_id', agendamentoAtual.medico_id);
   }
 
-  // Salva o novo agendamento como reagendamento (inclui notificação e WhatsApp diferenciados)
-  return salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, { isReagendamento: true, dataAnterior, pacienteTelefone });
+  // Salva o novo agendamento como reagendamento
+  const result = await salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, { isReagendamento: true, dataAnterior, pacienteTelefone });
+
+  // B2 — Se o novo slot estava ocupado, restaura o agendamento original para não deixar o paciente sem consulta
+  if (result?.error === 'slot_taken' && agendamentoAtual) {
+    await supabase.from('agendamentos')
+      .update({ status: 'confirmado' })
+      .eq('id', agendamentoAtual.id);
+    if (agendamentoAtual.medico_id) {
+      await supabase.from('horarios_disponiveis')
+        .update({ disponivel: false })
+        .eq('clinica_id', clinicaId)
+        .eq('data_hora', agendamentoAtual.data_hora)
+        .eq('medico_id', agendamentoAtual.medico_id);
+    }
+  }
+
+  return result;
 }
 
 async function encerrarConversa(conversaId, resolucao = 'ia') {
