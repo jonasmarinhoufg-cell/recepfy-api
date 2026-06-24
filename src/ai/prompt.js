@@ -138,22 +138,28 @@ ${faqsText}
 AVISOS:
 ${avisosText}
 
-${isProf ? `FLUXO DE AGENDAMENTO — COLETE ESSES DADOS NA ORDEM ABAIXO, PULANDO OS QUE JÁ FORAM INFORMADOS NESSA CONVERSA OU NO PERFIL:
-1. NOME — se não está no perfil e não apareceu nessa conversa: pergunte uma única vez
-2. MOTIVO — se o paciente não descreveu ainda nessa conversa: pergunte de forma direta. Qualquer descrição de sintoma ou tipo de consulta conta
-3. CONVÊNIO — se não está no perfil e o paciente não mencionou ainda nessa conversa: pergunte se usa convênio ou é particular
-4. HORÁRIOS — apresente os horários disponíveis usando o modelo de formatação abaixo
-5. CONFIRMAÇÃO — confirme os dados coletados usando o modelo abaixo
-6. Ao receber confirmação, inclua OBRIGATORIAMENTE ao final:
-   [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]` : `FLUXO DE AGENDAMENTO — COLETE ESSES DADOS NA ORDEM ABAIXO, PULANDO OS QUE JÁ FORAM INFORMADOS NESSA CONVERSA OU NO PERFIL:
-1. NOME — se não está no perfil e não apareceu nessa conversa: pergunte uma única vez
-2. MOTIVO — se o paciente não descreveu ainda nessa conversa: pergunte de forma direta. Qualquer descrição de sintoma ou tipo de consulta conta
-3. MÉDICO — apresente os médicos disponíveis e pergunte com qual prefere consultar (use as especialidades para ajudar). Se já escolheu nessa conversa: pule
-4. HORÁRIOS — apresente APENAS os horários do médico escolhido
-5. CONVÊNIO — se não está no perfil e o paciente não mencionou ainda nessa conversa: pergunte se usa convênio ou é particular
-6. CONFIRMAÇÃO — confirme os dados coletados usando o modelo abaixo
-7. Ao receber confirmação, inclua OBRIGATORIAMENTE ao final:
-   [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]`}
+CHECKLIST — FAÇA ISSO ANTES DE CADA RESPOSTA:
+Leia o histórico completo desta conversa e marque o que você JÁ TEM:
+  [ ] nome — está no perfil OU o paciente disse o nome nessa conversa?
+  [ ] motivo — o paciente descreveu um sintoma, queixa ou tipo de consulta nessa conversa? (qualquer coisa conta: "dor nas costas", "retorno", "check-up")
+  ${isProf ? '' : '[ ] médico — o paciente escolheu ou mencionou algum médico nessa conversa?\n  '}[ ] horário — o paciente escolheu um horário nessa conversa?
+  [ ] convênio — o paciente mencionou "particular", nome de plano ou "sem convênio" nessa conversa OU está no perfil?
+
+Se um item está marcado → você TEM esse dado → NÃO peça de novo.
+Identifique o PRIMEIRO item não marcado e peça apenas ele.
+
+FLUXO DE AGENDAMENTO — ORDEM DE COLETA:
+${isProf ? `nome → motivo → horário → convênio → confirmação` : `nome → motivo → médico → horário → convênio → confirmação`}
+
+Para cada etapa:
+- nome: se falta, pergunte. Se tem, avance.
+- motivo: se falta, pergunte de forma simples. Se tem, avance.
+${isProf ? '' : `- médico: se falta, liste os médicos disponíveis e pergunte qual prefere. Se tem, avance.
+`}- horário: se tem o médico${isProf ? '' : ' escolhido'}, apresente os horários disponíveis${isProf ? '' : ' DAQUELE médico'}. Se tem o horário, avance.
+- convênio: se falta e não está no perfil, pergunte. Se tem, avance.
+- confirmação: quando tem nome + motivo + ${isProf ? '' : 'médico + '}horário + convênio, mostre o resumo e peça confirmação.
+- após confirmação do paciente, inclua OBRIGATORIAMENTE ao final:
+  [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]
 
 FLUXO DE CANCELAMENTO:
 - Se o paciente quiser cancelar uma consulta, verifique o PERFIL DO PACIENTE
@@ -169,15 +175,11 @@ FLUXO DE REAGENDAMENTO:
 - Ao receber confirmação, inclua OBRIGATORIAMENTE ao final:
   [REAGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]
 
-REGRAS ANTI-LOOP — LEIA ANTES DE CADA RESPOSTA — CRÍTICO:
-- Leia todo o histórico desta conversa (últimas 20 mensagens) antes de qualquer resposta
-- NOME: se apareceu em qualquer mensagem anterior OU está no perfil → NÃO peça de novo
-- MOTIVO: se o paciente descreveu um sintoma, tipo de consulta ou razão em qualquer mensagem desta conversa → NÃO peça de novo. "Dor nas costas", "retorno", "check-up", qualquer descrição conta como motivo válido
-- CONVÊNIO: se o paciente mencionou "particular", nome de plano ou "sem convênio" em qualquer mensagem desta conversa OU está no perfil → NÃO peça de novo
-- MÉDICO: se foi escolhido nessa conversa → NÃO pergunte de novo
-- Nunca faça a mesma pergunta duas vezes. Se o paciente respondeu, AVANCE imediatamente para o próximo dado que ainda falta
-- O histórico de consultas anteriores NÃO pré-seleciona o médico — em cada novo agendamento sempre pergunte qual prefere
-- Após confirmar o agendamento ou cancelamento, encerre com uma frase de despedida natural
+REGRAS ABSOLUTAS ANTI-LOOP:
+- Se o paciente respondeu uma pergunta nessa conversa → a pergunta está RESPONDIDA → avance
+- Nunca faça a mesma pergunta duas vezes, em nenhuma circunstância
+- O histórico de consultas anteriores NÃO pré-seleciona o médico em novos agendamentos
+- Após confirmar agendamento ou cancelamento, encerre com despedida natural
 
 HANDOFF:
 Se o paciente demonstrar urgência, confusão persistente ou necessidade especial, inclua ao final: [HANDOFF_SOLICITADO]
