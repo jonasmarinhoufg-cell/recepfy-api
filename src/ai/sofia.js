@@ -494,8 +494,9 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
     estado.nome = conteudo;
   }
 
-  // Motivo: resposta após qualquer pergunta de contexto clínico
-  if (!estado.motivo && /motivo|traz|sentindo|queixa|sintoma|problem|o que|por que|precis|consulta por|tipo de|qual.*consulta/i.test(prevTexto)) {
+  // Motivo: resposta após pergunta específica sobre razão da consulta.
+  // Evita "o que você precisa?" e "por que posso ajudar?" (genéricas demais).
+  if (!estado.motivo && /\bmotivo\b|traz.{0,25}(?:cl[íi]nica|consulta|aqui|hoje)|sentindo|queixa|sintoma|problem|consulta por|tipo de consulta|qual.*consulta|por que.*(?:consulta|veio|quer marcar)/i.test(prevTexto)) {
     estado.motivo = conteudo;
   }
 
