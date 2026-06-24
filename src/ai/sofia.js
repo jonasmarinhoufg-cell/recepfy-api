@@ -293,25 +293,25 @@ async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, 
     .limit(1)
     .maybeSingle();
 
-  // Cancela o agendamento atual, se existir
+  const dataAnterior = agendamentoAtual
+    ? formatBRT(agendamentoAtual.data_hora, { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    : null;
+
+  // Cancela o agendamento atual e libera o slot
   if (agendamentoAtual) {
     await supabase.from('agendamentos')
       .update({ status: 'cancelado' })
       .eq('id', agendamentoAtual.id);
+
+    await supabase.from('horarios_disponiveis')
+      .update({ disponivel: true })
+      .eq('clinica_id', clinicaId)
+      .eq('data_hora', agendamentoAtual.data_hora)
+      .eq('medico_id', agendamentoAtual.medico_id);
   }
 
-  // Salva o novo agendamento
-  await salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade);
-
-  // Notificação de reagendamento
-  const medicoId = agendamentoAtual?.medico_id || null;
-  await supabase.from('notificacoes').insert({
-    clinica_id: clinicaId,
-    ...(medicoId ? { medico_id: medicoId } : {}),
-    tipo:   'agendamento',
-    titulo: 'Consulta reagendada pela Sofia',
-    corpo:  `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`,
-  });
+  // Salva o novo agendamento como reagendamento (inclui notificação e WhatsApp diferenciados)
+  await salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, { isReagendamento: true, dataAnterior });
 }
 
 async function encerrarConversa(conversaId, resolucao = 'ia') {
@@ -395,7 +395,8 @@ async function atualizarConvenioPaciente(pacienteId, convenio) {
 // Para profissional: médico_id é buscado pelo campo medico_nome da clinica
 // Para clínica: busca pelo nome do médico na tabela medicos
 
-async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade) {
+async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, opts = {}) {
+  const { isReagendamento = false, dataAnterior = null } = opts;
   let medicoId = null;
   let telefoneMedico = null;
 
@@ -428,7 +429,7 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
     data_hora: dataHoraAgendamento,
     motivo: booking.motivo,
     status: 'confirmado',
-    origem: 'sofia',
+    origem: isReagendamento ? 'reagendamento' : 'sofia',
     modalidade_conta: modalidade,
   });
 
@@ -443,13 +444,16 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   if (medicoId) slotQ = slotQ.eq('medico_id', medicoId);
   await slotQ;
 
-  // Notificação na plataforma (sempre, mesmo sem medico_id para profissional)
+  // Notificação na plataforma
+  const notifCorpo = isReagendamento && dataAnterior
+    ? `${booking.nome} — reagendado de ${dataAnterior} → ${booking.data} às ${booking.hora}`
+    : `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`;
   await supabase.from('notificacoes').insert({
     clinica_id: clinicaId,
     medico_id:  medicoId,
-    tipo:       'agendamento',
-    titulo:     'Novo agendamento pela Sofia',
-    corpo:      `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`,
+    tipo:       isReagendamento ? 'reagendamento' : 'agendamento',
+    titulo:     isReagendamento ? 'Consulta reagendada pela Sofia' : 'Novo agendamento pela Sofia',
+    corpo:      notifCorpo,
   });
 
   // Notificação WhatsApp pessoal do médico/profissional
@@ -461,13 +465,14 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
       if (wha?.instance_name) {
         const tel = normalizePhone(telefoneMedico);
         if (tel) {
-          const linhas = [
-            '📅 *Novo agendamento via Sofia*',
-            '',
+          const header = isReagendamento ? '🔄 *Reagendamento via Sofia*' : '📅 *Novo agendamento via Sofia*';
+          const linhas = [header, ''];
+          if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`);
+          linhas.push(
             `*Paciente:* ${booking.nome}`,
             `*Data:* ${booking.data} às ${booking.hora}`,
             `*Motivo:* ${booking.motivo || '—'}`,
-          ];
+          );
           if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
           await sendMessage(wha.instance_name, tel, linhas.join('\n'));
         }
