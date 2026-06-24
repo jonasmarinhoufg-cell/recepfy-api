@@ -48,8 +48,8 @@ router.post('/whatsapp', async (req, res) => {
       res.sendStatus(200);
       const { data: instancia } = await supabase
         .from('whatsapp_instancias').select('clinica_id')
-        .eq('instance_name', instanceName).single();
-      if (!instancia) return;
+        .eq('instance_name', instanceName).maybeSingle();
+      if (!instancia) { console.warn('[webhook] Instância não encontrada (áudio):', instanceName); return; }
 
       try {
         const transcricao = await transcribeAudioMessage(instanceName, data.key, data.message);
@@ -62,7 +62,7 @@ router.post('/whatsapp', async (req, res) => {
         const resposta = await processarMensagem(instancia.clinica_id, telefone, transcricao);
         await sendMessage(instanceName, telefone, resposta);
       } catch (e) {
-        console.error('Erro ao transcrever áudio:', e.message);
+        console.error('Erro ao transcrever áudio:', e);
         await new Promise(r => setTimeout(r, 1200));
         await sendMessage(instanceName, telefone,
           'Não consegui ouvir seu áudio. Pode digitar o que precisa? 🙏'
@@ -83,7 +83,7 @@ router.post('/whatsapp', async (req, res) => {
       if (temMidia) {
         const { data: instancia } = await supabase
           .from('whatsapp_instancias').select('clinica_id')
-          .eq('instance_name', instanceName).single();
+          .eq('instance_name', instanceName).maybeSingle();
         if (instancia) {
           await new Promise(r => setTimeout(r, 1200));
           await sendMessage(instanceName, telefone,
@@ -96,10 +96,10 @@ router.post('/whatsapp', async (req, res) => {
 
     const { data: instancia } = await supabase
       .from('whatsapp_instancias').select('clinica_id')
-      .eq('instance_name', instanceName).single();
+      .eq('instance_name', instanceName).maybeSingle();
 
     if (!instancia) {
-      console.error('[webhook] Instância não encontrada:', instanceName);
+      console.warn('[webhook] Instância não encontrada:', instanceName);
       return res.sendStatus(200);
     }
 

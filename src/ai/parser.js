@@ -13,8 +13,14 @@ function parseResponse(text) {
   const bookingMatch = text.match(/\[AGENDAMENTO_CONFIRMADO:(.*?)\]/s);
   if (bookingMatch) {
     try {
-      result.booking = JSON.parse(bookingMatch[1]);
-      result.message = text.replace(/\[AGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+      const b = JSON.parse(bookingMatch[1]);
+      const faltando = ['nome', 'data', 'hora', 'medico'].filter(k => !b[k]);
+      if (faltando.length > 0) {
+        console.error('AGENDAMENTO_CONFIRMADO com campos faltando:', faltando, b);
+      } else {
+        result.booking = b;
+        result.message = text.replace(/\[AGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+      }
     } catch (e) {
       console.error('Erro ao parsear agendamento:', e.message);
     }
@@ -24,8 +30,14 @@ function parseResponse(text) {
   const reagendamentoMatch = text.match(/\[REAGENDAMENTO_CONFIRMADO:(.*?)\]/s);
   if (reagendamentoMatch) {
     try {
-      result.reagendamento = JSON.parse(reagendamentoMatch[1]);
-      result.message = text.replace(/\[REAGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+      const r = JSON.parse(reagendamentoMatch[1]);
+      const faltando = ['nome', 'data', 'hora', 'medico'].filter(k => !r[k]);
+      if (faltando.length > 0) {
+        console.error('REAGENDAMENTO_CONFIRMADO com campos faltando:', faltando, r);
+      } else {
+        result.reagendamento = r;
+        result.message = text.replace(/\[REAGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+      }
     } catch (e) {
       console.error('Erro ao parsear reagendamento:', e.message);
     }
