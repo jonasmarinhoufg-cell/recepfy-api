@@ -445,16 +445,19 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   await slotQ;
 
   // Notificação na plataforma
+  // Nota: tipo usa sempre 'agendamento' para compatibilidade com o schema DB.
+  // O campo titulo distingue novo agendamento de reagendamento.
   const notifCorpo = isReagendamento && dataAnterior
     ? `${booking.nome} — reagendado de ${dataAnterior} → ${booking.data} às ${booking.hora}`
     : `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`;
-  await supabase.from('notificacoes').insert({
+  const { error: notifErr } = await supabase.from('notificacoes').insert({
     clinica_id: clinicaId,
     medico_id:  medicoId,
-    tipo:       isReagendamento ? 'reagendamento' : 'agendamento',
+    tipo:       'agendamento',
     titulo:     isReagendamento ? 'Consulta reagendada pela Sofia' : 'Novo agendamento pela Sofia',
     corpo:      notifCorpo,
   });
+  if (notifErr) console.error('Erro ao criar notificação:', notifErr.message);
 
   // Notificação WhatsApp pessoal do médico/profissional
   if (telefoneMedico) {
