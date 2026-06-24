@@ -490,18 +490,18 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
   const texto = conteudo.toLowerCase();
 
   // Nome: resposta após pergunta de nome
-  if (!estado.nome && /nome|chama/i.test(prevTexto) && conteudo.length < 80) {
+  if (!estado.nome && /nome|chama|chamo/i.test(prevTexto) && conteudo.length < 80) {
     estado.nome = conteudo;
   }
 
-  // Motivo: resposta após pergunta de motivo/consulta
-  if (!estado.motivo && /motivo|consulta|trazendo|sentindo|queixa/i.test(prevTexto)) {
+  // Motivo: resposta após qualquer pergunta de contexto clínico
+  if (!estado.motivo && /motivo|traz|sentindo|queixa|sintoma|problem|o que|por que|precis|consulta por|tipo de|qual.*consulta/i.test(prevTexto)) {
     estado.motivo = conteudo;
   }
 
-  // Médico (apenas clinica): resposta após lista de médicos OU menção direta com contexto
+  // Médico: detecta nome de médico em qualquer resposta com contexto relevante
   if (!isProf && !estado.medico) {
-    const perguntaSobreMedico = /médico|prefere|escolh|consultar|especialista|profissional/i.test(prevTexto);
+    const perguntaSobreMedico = /médico|prefere|escolh|consultar|especialista|profissional|qual.*quer|qual.*deseja|qual.*indica/i.test(prevTexto);
     const medicos = config.medicos || [];
 
     const match = medicos.find(m => {
@@ -509,19 +509,23 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
       return texto.includes(primeiroNome);
     });
 
-    if (match && (perguntaSobreMedico || /\b(com|dr\.?|dra\.?)\b/i.test(texto) || conteudo.length < 40)) {
-      estado.medico = match.nome;
-    } else if (perguntaSobreMedico && !match && conteudo.length < 50) {
-      // Fallback: paciente respondeu à pergunta mas não mencionou nome reconhecível
+    if (match) {
+      // Nome encontrado — captura se: foi perguntado sobre médico, ou há "com/dr/dra", ou msg curta
+      if (perguntaSobreMedico || /\bcom\b|dr\.?|dra\.?/i.test(texto) || conteudo.length < 40) {
+        estado.medico = match.nome;
+      }
+    } else if (perguntaSobreMedico && conteudo.length < 50) {
+      // Pergunta sobre médico mas nome não reconhecido → captura resposta curta como seleção
       estado.medico = conteudo;
     }
   }
 
-  // Horário: resposta com número após pergunta de horário OU após mensagem com lista de datas/horas
+  // Horário: detecta por contexto da pergunta anterior OU por padrão de data/hora no próprio conteúdo
   if (!estado.horario) {
-    const prevTemPerguntaHora = /horário|quando|data|hora/i.test(prevTexto);
-    const prevTemListaHora   = /\d{1,2}:\d{2}|\d{2}\/\d{2}|segunda|terça|quarta|quinta|sexta/i.test(prevTexto);
-    if ((prevTemPerguntaHora || prevTemListaHora) && /\d/.test(conteudo)) {
+    const prevTemHora    = /horário|quando|data|hora|agendar para/i.test(prevTexto);
+    const prevTemLista   = /\d{1,2}:\d{2}|\d{2}\/\d{2}|segunda|ter[çc]a|quarta|quinta|sexta/i.test(prevTexto);
+    const conteudoTemDT  = /\d{1,2}[\/h:]\d{2}|\d{1,2}\s*(h|hs|hrs)\b|segunda|ter[çc]a|quarta|quinta|sexta/i.test(conteudo);
+    if ((prevTemHora || prevTemLista || conteudoTemDT) && /\d/.test(conteudo)) {
       estado.horario = conteudo;
     }
   }
@@ -532,6 +536,11 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
       estado.convenio = 'Particular';
     } else if (/conv[eê]nio|plano/i.test(prevTexto) && conteudo.length < 60) {
       estado.convenio = conteudo;
+    } else if (/conv[eê]nio|plano/i.test(texto) && !/perguntar|informar|verificar/i.test(texto)) {
+      // Paciente menciona convênio espontaneamente
+      const plans = (config.sofia?.convenios || []);
+      const matchPlan = plans.find(p => texto.includes(p.toLowerCase()));
+      if (matchPlan) estado.convenio = matchPlan;
     }
   }
 }
@@ -661,14 +670,17 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     const estadoConversa = extrairEstadoConversa(historico, mensagem, paciente, config);
     const estadoInjetado = buildEstadoInjetado(estadoConversa, config);
 
+    // Log para debug no Railway — mostra o estado calculado antes de chamar Claude
+    console.log(`[SOFIA] clinica=${clinicaId} tel=${telefone} estado=${JSON.stringify(estadoConversa)}`);
+
     // 5. Salva mensagem do paciente ANTES de processar
     await salvarMensagem(conversa.id, 'user', mensagem);
 
-    // 6. Envia para Claude com estado explícito injetado no system prompt
+    // 6. Envia para Claude — estado vai NO INÍCIO do system prompt (maior atenção do modelo)
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1000,
-      system: buildPrompt(config, perfilPaciente) + estadoInjetado,
+      system: estadoInjetado + '\n\n' + buildPrompt(config, perfilPaciente),
       messages: [...historico, { role: 'user', content: mensagem }],
     });
 

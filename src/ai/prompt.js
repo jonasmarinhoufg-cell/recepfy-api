@@ -139,10 +139,9 @@ AVISOS:
 ${avisosText}
 
 FLUXO DE AGENDAMENTO:
-O sistema calculou o estado desta conversa — veja "ESTADO ATUAL DO AGENDAMENTO" ao final deste prompt.
-Siga EXATAMENTE a "PRÓXIMA AÇÃO OBRIGATÓRIA" indicada lá.
-Não peça nada marcado com ✓. Execute apenas o próximo passo.
-Quando todos os dados estiverem coletados (✓ em tudo), mostre o resumo, peça confirmação e inclua ao final:
+O estado do agendamento está no INÍCIO deste prompt (seção ESTADO ATUAL DO AGENDAMENTO).
+Siga SOMENTE a "PRÓXIMA AÇÃO OBRIGATÓRIA" indicada lá — não invente passos, não repita perguntas marcadas com ✓.
+Quando todos os campos estiverem com ✓, mostre o resumo, peça confirmação e feche com:
 [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]
 
 FLUXO DE CANCELAMENTO:
