@@ -1,9 +1,10 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const cron = require('node-cron');
 
 const whatsappWebhook = require('./webhooks/whatsapp');
-const { invalidateCache } = require('./ai/sofia');
+const { invalidateCache, enviarNpsPendentes } = require('./ai/sofia');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -70,3 +71,9 @@ app.use('/webhooks', whatsappWebhook);
 app.listen(PORT, () => {
   console.log(`Recepfy API rodando na porta ${PORT}`);
 });
+
+// NPS pós-consulta — roda todo dia às 19h BRT
+cron.schedule('0 19 * * *', () => {
+  console.log('[CRON] Disparando NPS pós-consulta...');
+  enviarNpsPendentes().catch(e => console.error('[CRON] Erro NPS:', e.message));
+}, { timezone: 'America/Sao_Paulo' });

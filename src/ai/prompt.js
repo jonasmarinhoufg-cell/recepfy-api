@@ -103,7 +103,7 @@ function buildPrompt(config, perfilPaciente = '') {
             .join('\n\n');
         }
       })()
-    : `Sem horários cadastrados no momento — informe o paciente e sugira ${isProf ? 'ligar para o consultório' : 'ligar para a clínica'}: ${clinica.telefone || 'número não informado'}`;
+    : 'Sem horários disponíveis no momento';
 
   // ── Avisos ─────────────────────────────────────────────────────────────────
   const avisosText = sofia.avisos?.length > 0
@@ -161,6 +161,13 @@ FLUXO DE REAGENDAMENTO:
 REGRAS DO FLUXO:
 - O histórico de consultas anteriores NÃO pré-seleciona o médico em novos agendamentos
 - Após confirmar agendamento ou cancelamento, encerre com despedida natural
+
+FLUXO DE LISTA DE ESPERA:
+- Se não houver horários disponíveis, informe o paciente com empatia
+- Ofereça registrar o interesse: "Posso anotar seu interesse e te avisamos quando um horário abrir"
+- Se o paciente aceitar, colete o nome (já conhecido do perfil se houver) e finalize com:
+  [LISTA_ESPERA:{"nome":"...","medico":"...","motivo":"..."}]
+- Se o paciente recusar, sugira ligar para ${isProf ? 'o consultório' : 'a clínica'}: ${clinica.telefone || 'o número da clínica'}
 
 HANDOFF:
 Se o paciente demonstrar urgência, confusão persistente ou necessidade especial, inclua ao final: [HANDOFF_SOLICITADO]

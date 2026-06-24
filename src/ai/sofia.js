@@ -76,8 +76,9 @@ async function getClinicConfig(clinicaId) {
       .eq('clinica_id', clinicaId)
       .eq('disponivel', true)
       .gte('data_hora', new Date().toISOString())
+      .lte('data_hora', new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString())
       .order('data_hora', { ascending: true })
-      .limit(30),
+      .limit(60),
   ]);
 
   const data = {
@@ -280,7 +281,7 @@ async function cancelarAgendamento(clinicaId, pacienteId) {
   return true;
 }
 
-async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade) {
+async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, pacienteTelefone = null) {
   // Busca o próximo agendamento confirmado/reagendado do paciente
   const { data: agendamentoAtual } = await supabase
     .from('agendamentos')
@@ -311,7 +312,7 @@ async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, 
   }
 
   // Salva o novo agendamento como reagendamento (inclui notificação e WhatsApp diferenciados)
-  await salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, { isReagendamento: true, dataAnterior });
+  return salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, { isReagendamento: true, dataAnterior, pacienteTelefone });
 }
 
 async function encerrarConversa(conversaId, resolucao = 'ia') {
@@ -396,7 +397,7 @@ async function atualizarConvenioPaciente(pacienteId, convenio) {
 // Para clínica: busca pelo nome do médico na tabela medicos
 
 async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, opts = {}) {
-  const { isReagendamento = false, dataAnterior = null } = opts;
+  const { isReagendamento = false, dataAnterior = null, pacienteTelefone = null } = opts;
   let medicoId = null;
   let telefoneMedico = null;
 
@@ -421,6 +422,23 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
 
   const dataHoraAgendamento = parseBookingDateTime(booking.data, booking.hora);
 
+  // #4 — Verifica race condition: slot ainda disponível antes de inserir
+  if (medicoId) {
+    const { data: slotCheck } = await supabase
+      .from('horarios_disponiveis')
+      .select('disponivel')
+      .eq('clinica_id', clinicaId)
+      .eq('data_hora', dataHoraAgendamento)
+      .eq('medico_id', medicoId)
+      .eq('disponivel', true)
+      .maybeSingle();
+
+    if (!slotCheck) {
+      console.warn(`[SOFIA] Slot já ocupado — clinica=${clinicaId} medico=${medicoId} data=${dataHoraAgendamento}`);
+      return { success: false, error: 'slot_taken' };
+    }
+  }
+
   const { error } = await supabase.from('agendamentos').insert({
     clinica_id: clinicaId,
     paciente_id: pacienteId,
@@ -435,7 +453,7 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
 
   if (error) {
     console.error('Erro ao salvar agendamento:', error.message);
-    return;
+    return { success: false, error: 'db_error' };
   }
 
   // Marca o slot como indisponível para evitar duplo agendamento
@@ -459,35 +477,65 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   });
   if (notifErr) console.error('Erro ao criar notificação:', notifErr.message);
 
+  // Busca instância WhatsApp uma vez para usar nas duas notificações abaixo
+  let whaInstance = null;
+  try {
+    const { data: wha } = await supabase
+      .from('whatsapp_instancias').select('instance_name')
+      .eq('clinica_id', clinicaId).maybeSingle();
+    whaInstance = wha?.instance_name || null;
+  } catch (e) {
+    console.error('Erro ao buscar instância WhatsApp:', e.message);
+  }
+
   // Notificação WhatsApp pessoal do médico/profissional
-  if (telefoneMedico) {
+  if (telefoneMedico && whaInstance) {
     try {
-      const { data: wha } = await supabase
-        .from('whatsapp_instancias').select('instance_name')
-        .eq('clinica_id', clinicaId).maybeSingle();
-      if (wha?.instance_name) {
-        const tel = normalizePhone(telefoneMedico);
-        if (tel) {
-          const header = isReagendamento ? '🔄 *Reagendamento via Sofia*' : '📅 *Novo agendamento via Sofia*';
-          const linhas = [header, ''];
-          if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`);
-          linhas.push(
-            `*Paciente:* ${booking.nome}`,
-            `*Data:* ${booking.data} às ${booking.hora}`,
-            `*Motivo:* ${booking.motivo || '—'}`,
-          );
-          if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
-          await sendMessage(wha.instance_name, tel, linhas.join('\n'));
-        }
+      const tel = normalizePhone(telefoneMedico);
+      if (tel) {
+        const header = isReagendamento ? '🔄 *Reagendamento via Sofia*' : '📅 *Novo agendamento via Sofia*';
+        const linhas = [header, ''];
+        if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`);
+        linhas.push(
+          `*Paciente:* ${booking.nome}`,
+          `*Data:* ${booking.data} às ${booking.hora}`,
+          `*Motivo:* ${booking.motivo || '—'}`,
+        );
+        if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
+        await sendMessage(whaInstance, tel, linhas.join('\n'));
       }
     } catch (e) {
       console.error('Erro ao notificar médico via WhatsApp:', e.message);
     }
   }
 
+  // #3 — Confirmação estruturada ao paciente via WhatsApp
+  if (pacienteTelefone && whaInstance) {
+    try {
+      const tel = normalizePhone(pacienteTelefone);
+      if (tel) {
+        const header = isReagendamento ? '🔄 *Reagendamento confirmado!*' : '✅ *Consulta confirmada!*';
+        const linhas = [header, ''];
+        if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`, '');
+        linhas.push(
+          `*Data:* ${booking.data}`,
+          `*Horário:* ${booking.hora}`,
+          `*Médico:* ${booking.medico}`,
+        );
+        if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
+        linhas.push('', 'Guarde essa mensagem! Para cancelar ou reagendar, responda por aqui.');
+        await sendMessage(whaInstance, tel, linhas.join('\n'));
+      }
+    } catch (e) {
+      console.error('Erro ao enviar confirmação ao paciente:', e.message);
+    }
+  }
+
   // Salva nome e convênio do paciente para contatos futuros
   await atualizarNomePaciente(pacienteId, booking.nome);
   if (booking.convenio) await atualizarConvenioPaciente(pacienteId, booking.convenio);
+
+  return { success: true };
 }
 
 // ─── ESTADO DA CONVERSA ───────────────────────────────────────────────────────
@@ -559,11 +607,12 @@ function extrairEstadoConversa(historico, mensagemAtual, paciente, config) {
   const isProf = config.clinica?.modalidade === 'profissional';
 
   const estado = {
-    nome:     paciente?.nome     || null,
-    motivo:   null,
-    medico:   isProf ? (config.clinica?.medico_nome || null) : null,
-    horario:  null,
-    convenio: paciente?.convenio || null,
+    nome:        paciente?.nome     || null,
+    motivo:      null,
+    medico:      isProf ? (config.clinica?.medico_nome || null) : null,
+    horario:     null,
+    convenio:    paciente?.convenio || null,
+    reagendando: false,
   };
 
   // Itera o histórico buscando pares pergunta→resposta
@@ -590,11 +639,41 @@ function extrairEstadoConversa(historico, mensagemAtual, paciente, config) {
     _aplicarMensagem(estado, mensagemAtual.trim(), prevTexto, isProf, config);
   }
 
+  // Detecta se o fluxo em curso é de reagendamento (não novo agendamento)
+  const textoConversa = [
+    ...historico.map(m => m.content || ''),
+    mensagemAtual || '',
+  ].join(' ');
+  estado.reagendando = /\breagend|\bmudar.{0,15}hor[aá]rio|\btrocar.{0,15}hor[aá]rio|\boutro.{0,15}hor[aá]rio|\bmudar.{0,15}consulta/i.test(textoConversa);
+
   return estado;
 }
 
-function buildEstadoInjetado(estado, config, mensagemAtual = '') {
+function buildEstadoInjetado(estado, config, mensagemAtual = '', agendamentoRecente = null) {
   const isProf = config.clinica?.modalidade === 'profissional';
+
+  // Fluxo de reagendamento tem prioridade — só ativa se há consulta ativa para reagendar
+  if (estado.reagendando && agendamentoRecente) {
+    const linhas = ['\n\n=== FLUXO ATIVO: REAGENDAMENTO ==='];
+    linhas.push('(Paciente quer mudar o horário — NÃO pergunte nome, médico ou motivo novamente)\n');
+
+    if (!estado.horario) {
+      linhas.push('✗ Novo horário: não escolhido ainda');
+      linhas.push('');
+      linhas.push('➡ PRÓXIMA AÇÃO OBRIGATÓRIA: APRESENTE os horários disponíveis e PERGUNTE qual o paciente prefere para o REAGENDAMENTO');
+    } else {
+      linhas.push(`✓ Novo horário escolhido: "${estado.horario}"`);
+      linhas.push('');
+      const partes = [];
+      if (estado.nome) partes.push(`nome: ${estado.nome}`);
+      partes.push(`horário: ${estado.horario}`);
+      if (!isProf && estado.medico) partes.push(`médico: ${estado.medico}`);
+      linhas.push(`➡ PRÓXIMA AÇÃO OBRIGATÓRIA: CONFIRME o reagendamento (${partes.join(', ')}) e feche com [REAGENDAMENTO_CONFIRMADO:{...}]`);
+    }
+
+    linhas.push('=====================================');
+    return linhas.join('\n');
+  }
 
   // Só ativa o fluxo de agendamento se já há dados coletados nesta conversa
   // OU se a mensagem atual tem intenção explícita de agendar.
@@ -644,6 +723,104 @@ function buildEstadoInjetado(estado, config, mensagemAtual = '') {
   return linhas.join('\n');
 }
 
+// ─── NPS ─────────────────────────────────────────────────────────────────────
+
+async function getNpsPendente(clinicaId, pacienteId) {
+  const { data } = await supabase
+    .from('agendamentos')
+    .select('id')
+    .eq('clinica_id', clinicaId)
+    .eq('paciente_id', pacienteId)
+    .not('nps_enviado_em', 'is', null)
+    .is('nps_nota', null)
+    .gte('nps_enviado_em', new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString())
+    .limit(1)
+    .maybeSingle();
+  return data;
+}
+
+// Chamado pelo cron job diário — envia NPS para consultas concluídas sem avaliação
+async function enviarNpsPendentes() {
+  const { data: agendamentos } = await supabase
+    .from('agendamentos')
+    .select('id, clinica_id, paciente_id, data_hora, medico_id, medicos(nome)')
+    .eq('status', 'confirmado')
+    .lt('data_hora', new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString())  // consulta já passou
+    .gt('data_hora', new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()) // máx 48h atrás
+    .is('nps_enviado_em', null);
+
+  if (!agendamentos?.length) {
+    console.log('[NPS] Nenhum agendamento pendente de avaliação');
+    return;
+  }
+
+  console.log(`[NPS] Enviando para ${agendamentos.length} agendamento(s)`);
+
+  for (const ag of agendamentos) {
+    try {
+      const [pacResult, whaResult] = await Promise.all([
+        supabase.from('pacientes').select('telefone, nome').eq('id', ag.paciente_id).maybeSingle(),
+        supabase.from('whatsapp_instancias').select('instance_name').eq('clinica_id', ag.clinica_id).maybeSingle(),
+      ]);
+
+      const pac = pacResult.data;
+      const wha = whaResult.data;
+      if (!pac?.telefone || !wha?.instance_name) continue;
+
+      const tel = normalizePhone(pac.telefone);
+      if (!tel) continue;
+
+      const medicoNome = ag.medicos?.nome || 'o médico';
+      const dataFormatada = formatBRT(ag.data_hora, { day: '2-digit', month: '2-digit' });
+      const primeiroNome = pac.nome ? `, ${pac.nome.split(' ')[0]}` : '';
+
+      const msg = [
+        `Olá${primeiroNome}! 😊`,
+        '',
+        `Como foi sua consulta com ${medicoNome} no dia ${dataFormatada}?`,
+        '',
+        'Avalie de 1 a 5:',
+        '1 — Péssimo',
+        '2 — Ruim',
+        '3 — Regular',
+        '4 — Bom',
+        '5 — Excelente ⭐',
+        '',
+        'Responda só o número. Sua opinião nos ajuda a melhorar!',
+      ].join('\n');
+
+      await sendMessage(wha.instance_name, tel, msg);
+      await supabase.from('agendamentos')
+        .update({ nps_enviado_em: new Date().toISOString() })
+        .eq('id', ag.id);
+
+    } catch (e) {
+      console.error(`[NPS] Erro no agendamento ${ag.id}:`, e.message);
+    }
+  }
+}
+
+// ─── LISTA DE ESPERA ──────────────────────────────────────────────────────────
+
+async function handleListaEspera(clinicaId, pacienteId, dados) {
+  const corpo = [
+    dados.nome ? `Paciente: ${dados.nome}` : null,
+    dados.medico ? `Médico preferido: ${dados.medico}` : null,
+    dados.motivo ? `Motivo: ${dados.motivo}` : null,
+  ].filter(Boolean).join(' · ');
+
+  await supabase.from('notificacoes').insert({
+    clinica_id: clinicaId,
+    tipo:       'agendamento',
+    titulo:     'Paciente entrou na lista de espera',
+    corpo:      corpo || 'Paciente quer ser avisado quando abrir horário',
+  });
+
+  // Registra na memória do paciente para enriquecer futuras conversas
+  const entrada = `Lista de espera em ${new Date().toLocaleDateString('pt-BR')}${dados.medico ? ` para ${dados.medico}` : ''}`;
+  await salvarMemoriaPaciente(pacienteId, entrada);
+}
+
 // ─── FUNÇÃO PRINCIPAL ─────────────────────────────────────────────────────────
 
 async function processarMensagem(clinicaId, telefone, mensagem) {
@@ -680,6 +857,25 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       return holdMsg;
     }
 
+    // 2b. #4 NPS pendente: paciente respondendo avaliação com número 1-5
+    const npsPendente = await getNpsPendente(clinicaId, paciente.id);
+    if (npsPendente && /^[1-5]$/.test(mensagem.trim())) {
+      const nota = parseInt(mensagem.trim(), 10);
+      await supabase.from('agendamentos').update({ nps_nota: nota }).eq('id', npsPendente.id);
+      const conversa = await getOrCreateConversa(clinicaId, paciente.id);
+      await salvarMensagem(conversa.id, 'user', mensagem);
+      const respostas = [
+        'Lamentamos que a experiência não tenha sido boa. Seu retorno vai nos ajudar a melhorar.',
+        'Obrigado pelo retorno honesto. Vamos trabalhar para melhorar.',
+        'Obrigado pela avaliação! Seu retorno é importante para nós.',
+        'Que bom saber! Obrigado por avaliar.',
+        'Fico muito feliz! Obrigado. Até a próxima. 😊',
+      ];
+      const npsResp = respostas[nota - 1];
+      await salvarMensagem(conversa.id, 'assistant', npsResp);
+      return npsResp;
+    }
+
     // 3. Conversa ativa (ou nova se passaram mais de 2h)
     const conversa = await getOrCreateConversa(clinicaId, paciente.id);
 
@@ -689,7 +885,8 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     // 4a. Extrai estado atual da conversa em código (evita loop de perguntas)
     // mensagem é passada para incluir a resposta atual no estado (ela ainda não está no histórico)
     const estadoConversa = extrairEstadoConversa(historico, mensagem, paciente, config);
-    const estadoInjetado = buildEstadoInjetado(estadoConversa, config, mensagem);
+    // #5 — passa agendamentoRecente para distinguir fluxo de reagendamento
+    const estadoInjetado = buildEstadoInjetado(estadoConversa, config, mensagem, agendamentoRecente);
 
     // Log para debug no Railway — mostra o estado calculado antes de chamar Claude
     console.log(`[SOFIA] clinica=${clinicaId} tel=${telefone} estado=${JSON.stringify(estadoConversa)}`);
@@ -708,19 +905,23 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     const rawText = response.content.map(b => b.text || '').join('');
     const parsed = parseResponse(rawText);
 
-    // 7. Salva resposta da Sofia
-    await salvarMensagem(
-      conversa.id, 'assistant', parsed.message,
-      response.usage?.output_tokens || 0
-    );
+    // 7. Processa ações ANTES de salvar a resposta (permite corrigir msg em caso de slot_taken)
+    let finalMessage = parsed.message;
 
     // 8. Agendamento confirmado
     if (parsed.booking) {
-      await salvarAgendamento(clinicaId, paciente.id, conversa.id, parsed.booking, modalidade);
-      await encerrarConversa(conversa.id, 'ia');
-      gerarResumoConversa(conversa.id)
-        .then(r => salvarMemoriaPaciente(paciente.id, r))
-        .catch(e => console.error('Resumo agendamento:', e.message));
+      const result = await salvarAgendamento(clinicaId, paciente.id, conversa.id, parsed.booking, modalidade, { pacienteTelefone: telefone });
+      if (result?.error === 'slot_taken') {
+        // Horário foi reservado por outro paciente — invalida cache e corrige a mensagem
+        invalidateCache(clinicaId);
+        finalMessage = 'Esse horário acabou de ser reservado por outro paciente. Veja os horários disponíveis e escolha outro.';
+        // Não encerra a conversa — paciente precisará escolher novo slot
+      } else {
+        await encerrarConversa(conversa.id, 'ia');
+        gerarResumoConversa(conversa.id)
+          .then(r => salvarMemoriaPaciente(paciente.id, r))
+          .catch(e => console.error('Resumo agendamento:', e.message));
+      }
     }
 
     // 9. Cancelamento confirmado
@@ -734,11 +935,16 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
 
     // 10. Reagendamento confirmado
     if (parsed.reagendamento) {
-      await reagendarAgendamento(clinicaId, paciente.id, conversa.id, parsed.reagendamento, modalidade);
-      await encerrarConversa(conversa.id, 'ia');
-      gerarResumoConversa(conversa.id)
-        .then(r => salvarMemoriaPaciente(paciente.id, r))
-        .catch(e => console.error('Resumo reagendamento:', e.message));
+      const result = await reagendarAgendamento(clinicaId, paciente.id, conversa.id, parsed.reagendamento, modalidade, telefone);
+      if (result?.error === 'slot_taken') {
+        invalidateCache(clinicaId);
+        finalMessage = 'Esse horário acabou de ser reservado por outro paciente. Escolha outro horário para o reagendamento.';
+      } else {
+        await encerrarConversa(conversa.id, 'ia');
+        gerarResumoConversa(conversa.id)
+          .then(r => salvarMemoriaPaciente(paciente.id, r))
+          .catch(e => console.error('Resumo reagendamento:', e.message));
+      }
     }
 
     // 11. Handoff — encerra, gera resumo para contexto do atendente e notifica
@@ -756,7 +962,15 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       });
     }
 
-    return parsed.message;
+    // 12. Lista de espera
+    if (parsed.listaEspera) {
+      await handleListaEspera(clinicaId, paciente.id, parsed.listaEspera);
+    }
+
+    // Salva a mensagem final da Sofia (pode ter sido corrigida em caso de slot_taken)
+    await salvarMensagem(conversa.id, 'assistant', finalMessage, response.usage?.output_tokens || 0);
+
+    return finalMessage;
 
   } catch (error) {
     console.error('Erro ao processar mensagem:', error.message);
@@ -764,4 +978,4 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
   }
 }
 
-module.exports = { processarMensagem, invalidateCache };
+module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes };

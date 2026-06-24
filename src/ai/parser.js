@@ -7,6 +7,7 @@ function parseResponse(text) {
     cancelamento: false,
     reagendamento: null,
     handoff:      false,
+    listaEspera:  null,
   };
 
   // Agendamento confirmado
@@ -53,6 +54,17 @@ function parseResponse(text) {
   if (text.includes('[HANDOFF_SOLICITADO]')) {
     result.handoff = true;
     result.message = text.replace('[HANDOFF_SOLICITADO]', '').trim();
+  }
+
+  // Lista de espera
+  const listaEsperaMatch = text.match(/\[LISTA_ESPERA:(.*?)\]/s);
+  if (listaEsperaMatch) {
+    try {
+      result.listaEspera = JSON.parse(listaEsperaMatch[1]);
+      result.message = text.replace(/\[LISTA_ESPERA:.*?\]/s, '').trim();
+    } catch (e) {
+      console.error('Erro ao parsear lista de espera:', e.message);
+    }
   }
 
   return result;
