@@ -8,6 +8,14 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { buildPrompt } = require('./prompt');
 const { parseResponse } = require('./parser');
 const { createClient } = require('@supabase/supabase-js');
+const { sendMessage } = require('../whatsapp/sender');
+
+function normalizePhone(raw) {
+  let d = (raw || '').replace(/\D/g, '');
+  if (!d) return '';
+  if (d.length <= 11) d = '55' + d;
+  return d;
+}
 
 const BRT_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC-3
 
@@ -69,7 +77,7 @@ async function getClinicConfig(clinicaId) {
       .eq('disponivel', true)
       .gte('data_hora', new Date().toISOString())
       .order('data_hora', { ascending: true })
-      .limit(12),
+      .limit(30),
   ]);
 
   const data = {
@@ -227,7 +235,7 @@ async function getHistorico(conversaId) {
     .select('role, conteudo')
     .eq('conversa_id', conversaId)
     .order('created_at', { ascending: true })
-    .limit(8);
+    .limit(20);
 
   return (data || []).map(m => ({ role: m.role, content: m.conteudo }));
 }
@@ -389,33 +397,35 @@ async function atualizarConvenioPaciente(pacienteId, convenio) {
 
 async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade) {
   let medicoId = null;
+  let telefoneMedico = null;
 
   if (modalidade === 'profissional') {
-    // Para profissional, busca o único médico da conta
-    const { data: medico } = await supabase
-      .from('medicos')
-      .select('id')
-      .eq('clinica_id', clinicaId)
-      .limit(1)
-      .maybeSingle();
-    medicoId = medico?.id || null;
+    // Profissional autônomo: usa o telefone cadastrado na própria clínica
+    const { data: cl } = await supabase.from('clinicas').select('telefone').eq('id', clinicaId).maybeSingle();
+    telefoneMedico = cl?.telefone || null;
   } else {
-    // Para clínica, busca pelo nome mencionado na conversa
-    const { data: medico } = await supabase
-      .from('medicos')
-      .select('id')
-      .eq('clinica_id', clinicaId)
-      .ilike('nome', `%${booking.medico}%`)
-      .maybeSingle();
-    medicoId = medico?.id || null;
+    // Clínica: busca flexível pelo nome (exato → parcial → fallback primeiro ativo)
+    const { data: todosMedicos } = await supabase
+      .from('medicos').select('id, nome, telefone').eq('clinica_id', clinicaId).eq('ativo', true);
+    if (todosMedicos?.length) {
+      const busca = (booking.medico || '').toLowerCase();
+      const match =
+        todosMedicos.find(m => m.nome.toLowerCase() === busca) ||
+        todosMedicos.find(m => m.nome.toLowerCase().includes(busca) || busca.includes(m.nome.toLowerCase())) ||
+        todosMedicos[0];
+      medicoId = match.id;
+      telefoneMedico = match.telefone || null;
+    }
   }
+
+  const dataHoraAgendamento = parseBookingDateTime(booking.data, booking.hora);
 
   const { error } = await supabase.from('agendamentos').insert({
     clinica_id: clinicaId,
     paciente_id: pacienteId,
     conversa_id: conversaId,
     medico_id: medicoId,
-    data_hora: parseBookingDateTime(booking.data, booking.hora),
+    data_hora: dataHoraAgendamento,
     motivo: booking.motivo,
     status: 'confirmado',
     origem: 'sofia',
@@ -427,20 +437,159 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
     return;
   }
 
-  // Notifica o médico — para profissional, notifica o próprio dono da conta
-  if (medicoId) {
-    await supabase.from('notificacoes').insert({
-      clinica_id: clinicaId,
-      medico_id: medicoId,
-      tipo: 'agendamento',
-      titulo: 'Novo agendamento pela Sofia',
-      corpo: `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`,
-    });
+  // Marca o slot como indisponível para evitar duplo agendamento
+  let slotQ = supabase.from('horarios_disponiveis').update({ disponivel: false })
+    .eq('clinica_id', clinicaId).eq('data_hora', dataHoraAgendamento);
+  if (medicoId) slotQ = slotQ.eq('medico_id', medicoId);
+  await slotQ;
+
+  // Notificação na plataforma (sempre, mesmo sem medico_id para profissional)
+  await supabase.from('notificacoes').insert({
+    clinica_id: clinicaId,
+    medico_id:  medicoId,
+    tipo:       'agendamento',
+    titulo:     'Novo agendamento pela Sofia',
+    corpo:      `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`,
+  });
+
+  // Notificação WhatsApp pessoal do médico/profissional
+  if (telefoneMedico) {
+    try {
+      const { data: wha } = await supabase
+        .from('whatsapp_instancias').select('instance_name')
+        .eq('clinica_id', clinicaId).maybeSingle();
+      if (wha?.instance_name) {
+        const tel = normalizePhone(telefoneMedico);
+        if (tel) {
+          const linhas = [
+            '📅 *Novo agendamento via Sofia*',
+            '',
+            `*Paciente:* ${booking.nome}`,
+            `*Data:* ${booking.data} às ${booking.hora}`,
+            `*Motivo:* ${booking.motivo || '—'}`,
+          ];
+          if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
+          await sendMessage(wha.instance_name, tel, linhas.join('\n'));
+        }
+      }
+    } catch (e) {
+      console.error('Erro ao notificar médico via WhatsApp:', e.message);
+    }
   }
 
   // Salva nome e convênio do paciente para contatos futuros
   await atualizarNomePaciente(pacienteId, booking.nome);
   if (booking.convenio) await atualizarConvenioPaciente(pacienteId, booking.convenio);
+}
+
+// ─── ESTADO DA CONVERSA ───────────────────────────────────────────────────────
+// Analisa o histórico em código (determinístico) para saber o que já foi coletado.
+// Injeta o estado no prompt para que Claude não repita perguntas.
+
+function extrairEstadoConversa(historico, paciente, config) {
+  const isProf = config.clinica?.modalidade === 'profissional';
+
+  const estado = {
+    nome:     paciente?.nome     || null,
+    motivo:   null,
+    medico:   isProf ? (config.clinica?.medico_nome || null) : null,
+    horario:  null,
+    convenio: paciente?.convenio || null,
+  };
+
+  for (let i = 0; i < historico.length; i++) {
+    const msg = historico[i];
+    if (msg.role !== 'user') continue;
+
+    const conteudo = (msg.content || '').trim();
+    if (!conteudo) continue;
+
+    // Última mensagem do assistente antes desta
+    let prevTexto = '';
+    for (let j = i - 1; j >= 0; j--) {
+      if (historico[j].role === 'assistant') {
+        prevTexto = (historico[j].content || '').toLowerCase();
+        break;
+      }
+    }
+
+    const texto = conteudo.toLowerCase();
+
+    // Nome: resposta após pergunta de nome
+    if (!estado.nome && /nome|chama/i.test(prevTexto) && conteudo.length < 80) {
+      estado.nome = conteudo;
+    }
+
+    // Motivo: resposta após pergunta de motivo/consulta
+    if (!estado.motivo && /motivo|consulta|trazendo|sentindo|queixa/i.test(prevTexto)) {
+      estado.motivo = conteudo;
+    }
+
+    // Médico (apenas clinica): resposta após lista de médicos
+    if (!isProf && !estado.medico && /médico|prefere|escolh|consultar com/i.test(prevTexto)) {
+      const match = (config.medicos || []).find(m => {
+        const primeiroNome = m.nome.toLowerCase().split(' ')[0];
+        return texto.includes(primeiroNome) || primeiroNome.includes(texto.split(' ')[0]);
+      });
+      estado.medico = match ? match.nome : conteudo;
+    }
+
+    // Horário: resposta numérica após pergunta de horário
+    if (!estado.horario && /horário|quando|data|hora/i.test(prevTexto) && /\d/.test(conteudo)) {
+      estado.horario = conteudo;
+    }
+
+    // Convênio: menção direta ou resposta após pergunta de convênio
+    if (!estado.convenio) {
+      if (/particular/i.test(texto) || /sem conv[eê]nio/i.test(texto)) {
+        estado.convenio = 'Particular';
+      } else if (/conv[eê]nio|plano/i.test(prevTexto)) {
+        estado.convenio = conteudo;
+      }
+    }
+  }
+
+  return estado;
+}
+
+function buildEstadoInjetado(estado, config) {
+  const isProf = config.clinica?.modalidade === 'profissional';
+  const linhas = ['\n\n=== ESTADO ATUAL DO AGENDAMENTO ==='];
+  linhas.push('(Calculado do histórico — NÃO repita perguntas para itens com ✓)\n');
+
+  linhas.push(estado.nome     ? `✓ Nome: "${estado.nome}"`           : '✗ Nome: não coletado');
+  linhas.push(estado.motivo   ? `✓ Motivo: "${estado.motivo}"`       : '✗ Motivo: não coletado');
+  if (!isProf) {
+    linhas.push(estado.medico ? `✓ Médico: "${estado.medico}"`       : '✗ Médico: não escolhido');
+  }
+  linhas.push(estado.horario  ? `✓ Horário: "${estado.horario}"`     : '✗ Horário: não escolhido');
+  linhas.push(estado.convenio ? `✓ Convênio: "${estado.convenio}"`   : '✗ Convênio: não informado');
+
+  linhas.push('');
+
+  let proximaAcao;
+  if (!estado.nome) {
+    proximaAcao = 'PERGUNTE o nome do paciente';
+  } else if (!estado.motivo) {
+    proximaAcao = 'PERGUNTE o motivo da consulta';
+  } else if (!isProf && !estado.medico) {
+    proximaAcao = 'APRESENTE os médicos disponíveis e PERGUNTE qual o paciente prefere';
+  } else if (!estado.horario) {
+    const med = !isProf && estado.medico ? ` do ${estado.medico}` : '';
+    proximaAcao = `APRESENTE os horários disponíveis${med} e PERGUNTE qual o paciente prefere`;
+  } else if (!estado.convenio) {
+    proximaAcao = 'PERGUNTE se usa convênio ou é particular';
+  } else {
+    const partes = [`nome: ${estado.nome}`, `motivo: ${estado.motivo}`];
+    if (!isProf) partes.push(`médico: ${estado.medico}`);
+    partes.push(`horário: ${estado.horario}`, `convênio: ${estado.convenio}`);
+    proximaAcao = `CONFIRME os dados (${partes.join(', ')}) e feche com [AGENDAMENTO_CONFIRMADO:{...}]`;
+  }
+
+  linhas.push(`➡ PRÓXIMA AÇÃO OBRIGATÓRIA: ${proximaAcao}`);
+  linhas.push('=====================================');
+
+  return linhas.join('\n');
 }
 
 // ─── FUNÇÃO PRINCIPAL ─────────────────────────────────────────────────────────
@@ -482,17 +631,21 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     // 3. Conversa ativa (ou nova se passaram mais de 2h)
     const conversa = await getOrCreateConversa(clinicaId, paciente.id);
 
-    // 4. Histórico desta conversa (últimas 8 mensagens)
+    // 4. Histórico desta conversa (últimas 20 mensagens)
     const historico = await getHistorico(conversa.id);
+
+    // 4a. Extrai estado atual da conversa em código (evita loop de perguntas)
+    const estadoConversa = extrairEstadoConversa(historico, paciente, config);
+    const estadoInjetado = buildEstadoInjetado(estadoConversa, config);
 
     // 5. Salva mensagem do paciente ANTES de processar
     await salvarMensagem(conversa.id, 'user', mensagem);
 
-    // 6. Envia para Claude
+    // 6. Envia para Claude com estado explícito injetado no system prompt
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1000,
-      system: buildPrompt(config, perfilPaciente),
+      system: buildPrompt(config, perfilPaciente) + estadoInjetado,
       messages: [...historico, { role: 'user', content: mensagem }],
     });
 
