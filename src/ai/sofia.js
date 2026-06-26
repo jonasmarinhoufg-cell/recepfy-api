@@ -825,6 +825,223 @@ async function enviarNpsPendentes() {
   }
 }
 
+// ─── LEMBRETE PRÉ-CONSULTA ───────────────────────────────────────────────────
+// Cron diário às 9h BRT — avisa pacientes com consulta no dia seguinte.
+// Apenas um aviso humanizado, sem pedir confirmação.
+
+async function enviarLembretes() {
+  // Janela "amanhã": consultas entre 20h e 32h a partir de agora
+  const de  = new Date(Date.now() + 20 * 60 * 60 * 1000).toISOString();
+  const ate = new Date(Date.now() + 32 * 60 * 60 * 1000).toISOString();
+
+  const { data: agendamentos } = await supabase
+    .from('agendamentos')
+    .select('id, clinica_id, paciente_id, data_hora, medicos(nome)')
+    .eq('status', 'confirmado')
+    .gte('data_hora', de)
+    .lte('data_hora', ate)
+    .is('lembrete_enviado_em', null);
+
+  if (!agendamentos?.length) {
+    console.log('[LEMBRETE] Nenhuma consulta amanhã para lembrar');
+    return;
+  }
+
+  console.log(`[LEMBRETE] Enviando para ${agendamentos.length} agendamento(s)`);
+
+  for (const ag of agendamentos) {
+    try {
+      const [pacResult, whaResult] = await Promise.all([
+        supabase.from('pacientes').select('telefone, nome').eq('id', ag.paciente_id).maybeSingle(),
+        supabase.from('whatsapp_instancias').select('instance_name').eq('clinica_id', ag.clinica_id).maybeSingle(),
+      ]);
+
+      const pac = pacResult.data;
+      const wha = whaResult.data;
+      if (!pac?.telefone || !wha?.instance_name) continue;
+
+      const tel = normalizePhone(pac.telefone);
+      if (!tel) continue;
+
+      const nome       = pac.nome ? pac.nome.split(' ')[0] : null;
+      const saudacao   = nome ? `Oi, ${nome}!` : 'Oi!';
+      const medicoNome = ag.medicos?.nome ? `com ${ag.medicos.nome}` : 'sua consulta';
+      const hora       = formatBRT(ag.data_hora, { hour: '2-digit', minute: '2-digit' });
+
+      const msg = [
+        `${saudacao} 😊`,
+        '',
+        `Só passando para te lembrar que amanhã você tem consulta ${medicoNome} às ${hora}. 🗓️`,
+        '',
+        `Se acontecer algum imprevisto, é só chamar aqui antes. Até amanhã!`,
+      ].join('\n');
+
+      await sendMessage(wha.instance_name, tel, msg);
+      await supabase.from('agendamentos')
+        .update({ lembrete_enviado_em: new Date().toISOString() })
+        .eq('id', ag.id);
+
+    } catch (e) {
+      console.error(`[LEMBRETE] Erro no agendamento ${ag.id}:`, e.message);
+    }
+  }
+}
+
+// ─── FOLLOW-UP PÓS-CONSULTA ───────────────────────────────────────────────────
+// Cron diário às 10h BRT — envia mensagem calorosa ~30 dias após consulta realizada.
+// Não empurra reagendamento — é genuinamente sobre saber como o paciente está.
+
+async function enviarFollowups() {
+  // Consultas realizadas há 28–32 dias (janela de 4 dias evita perder ou duplicar)
+  const de  = new Date(Date.now() - 32 * 24 * 60 * 60 * 1000).toISOString();
+  const ate = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: agendamentos } = await supabase
+    .from('agendamentos')
+    .select('id, clinica_id, paciente_id, data_hora, medicos(nome)')
+    .eq('status', 'realizado')
+    .gte('data_hora', de)
+    .lte('data_hora', ate)
+    .is('followup_enviado_em', null);
+
+  if (!agendamentos?.length) {
+    console.log('[FOLLOWUP] Nenhum follow-up pendente');
+    return;
+  }
+
+  console.log(`[FOLLOWUP] Enviando para ${agendamentos.length} paciente(s)`);
+
+  for (const ag of agendamentos) {
+    try {
+      // Não envia se paciente já tem consulta futura marcada — seria redundante
+      const { data: futuro } = await supabase
+        .from('agendamentos')
+        .select('id')
+        .eq('paciente_id', ag.paciente_id)
+        .eq('status', 'confirmado')
+        .gt('data_hora', new Date().toISOString())
+        .maybeSingle();
+      if (futuro) {
+        await supabase.from('agendamentos').update({ followup_enviado_em: new Date().toISOString() }).eq('id', ag.id);
+        continue;
+      }
+
+      const [pacResult, whaResult] = await Promise.all([
+        supabase.from('pacientes').select('telefone, nome').eq('id', ag.paciente_id).maybeSingle(),
+        supabase.from('whatsapp_instancias').select('instance_name').eq('clinica_id', ag.clinica_id).maybeSingle(),
+      ]);
+
+      const pac = pacResult.data;
+      const wha = whaResult.data;
+      if (!pac?.telefone || !wha?.instance_name) continue;
+
+      const tel = normalizePhone(pac.telefone);
+      if (!tel) continue;
+
+      const nome       = pac.nome ? pac.nome.split(' ')[0] : null;
+      const saudacao   = nome ? `Oi, ${nome}!` : 'Oi!';
+      const medicoNome = ag.medicos?.nome;
+
+      const msg = [
+        `${saudacao} Tudo bem? 😊`,
+        '',
+        medicoNome
+          ? `Faz um mês desde a sua consulta com ${medicoNome} aqui, e passamos só para dar um oi e saber como você está.`
+          : `Faz um mês desde a sua última consulta aqui, e passamos só para dar um oi e saber como você está.`,
+        '',
+        `Esperamos que esteja tudo ótimo! Qualquer coisa, é só chamar. 💙`,
+      ].join('\n');
+
+      await sendMessage(wha.instance_name, tel, msg);
+      await supabase.from('agendamentos')
+        .update({ followup_enviado_em: new Date().toISOString() })
+        .eq('id', ag.id);
+
+    } catch (e) {
+      console.error(`[FOLLOWUP] Erro no agendamento ${ag.id}:`, e.message);
+    }
+  }
+}
+
+// ─── REENGAJAMENTO DE PACIENTES DORMENTES ─────────────────────────────────────
+// Cron semanal às segundas 10h BRT — reengage pacientes sem contato há 90+ dias.
+// Tom genuíno de "sentimos sua falta", sem mencionar reagendamento diretamente.
+// Só dispara para quem teve ao menos uma consulta realizada (paciente real, não lead).
+
+async function enviarReengajamentos() {
+  const noventaDiasAtras = new Date(Date.now() - 90  * 24 * 60 * 60 * 1000).toISOString();
+  const seisMesesAtras   = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString();
+
+  // Pacientes com último contato há 90+ dias e sem reengajamento nos últimos 6 meses
+  const { data: pacientes } = await supabase
+    .from('pacientes')
+    .select('id, nome, telefone, clinica_id, reengajamento_enviado_em')
+    .not('ultimo_contato', 'is', null)
+    .lt('ultimo_contato', noventaDiasAtras)
+    .or(`reengajamento_enviado_em.is.null,reengajamento_enviado_em.lt.${seisMesesAtras}`);
+
+  if (!pacientes?.length) {
+    console.log('[REENGAJAMENTO] Nenhum paciente dormente encontrado');
+    return;
+  }
+
+  console.log(`[REENGAJAMENTO] Verificando ${pacientes.length} paciente(s)`);
+
+  for (const pac of pacientes) {
+    try {
+      if (!pac.telefone || !pac.clinica_id) continue;
+
+      // Só envia se o paciente tem ao menos uma consulta realizada
+      const { data: historico } = await supabase
+        .from('agendamentos')
+        .select('id')
+        .eq('paciente_id', pac.id)
+        .eq('status', 'realizado')
+        .maybeSingle();
+      if (!historico) continue;
+
+      // Não envia se paciente já tem consulta futura marcada
+      const { data: futuro } = await supabase
+        .from('agendamentos')
+        .select('id')
+        .eq('paciente_id', pac.id)
+        .eq('status', 'confirmado')
+        .gt('data_hora', new Date().toISOString())
+        .maybeSingle();
+      if (futuro) continue;
+
+      const { data: wha } = await supabase
+        .from('whatsapp_instancias')
+        .select('instance_name')
+        .eq('clinica_id', pac.clinica_id)
+        .maybeSingle();
+      if (!wha?.instance_name) continue;
+
+      const tel = normalizePhone(pac.telefone);
+      if (!tel) continue;
+
+      const nome     = pac.nome ? pac.nome.split(' ')[0] : null;
+      const saudacao = nome ? `Oi, ${nome}!` : 'Oi!';
+
+      const msg = [
+        `${saudacao} Como você está? 😊`,
+        '',
+        `Faz um tempinho que não temos notícias suas por aqui, e passamos só para dar um oi e saber se está tudo bem.`,
+        '',
+        `Cuide-se! Se precisar de nós, estamos por aqui. 💙`,
+      ].join('\n');
+
+      await sendMessage(wha.instance_name, tel, msg);
+      await supabase.from('pacientes')
+        .update({ reengajamento_enviado_em: new Date().toISOString() })
+        .eq('id', pac.id);
+
+    } catch (e) {
+      console.error(`[REENGAJAMENTO] Erro no paciente ${pac.id}:`, e.message);
+    }
+  }
+}
+
 // ─── LISTA DE ESPERA ──────────────────────────────────────────────────────────
 
 async function handleListaEspera(clinicaId, pacienteId, dados) {
@@ -1003,4 +1220,4 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
   }
 }
 
-module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes };
+module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos };

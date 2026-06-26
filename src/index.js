@@ -4,7 +4,7 @@ const cors = require('cors');
 const cron = require('node-cron');
 
 const whatsappWebhook = require('./webhooks/whatsapp');
-const { invalidateCache, enviarNpsPendentes } = require('./ai/sofia');
+const { invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos } = require('./ai/sofia');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -76,4 +76,22 @@ app.listen(PORT, () => {
 cron.schedule('0 19 * * *', () => {
   console.log('[CRON] Disparando NPS pós-consulta...');
   enviarNpsPendentes().catch(e => console.error('[CRON] Erro NPS:', e.message));
+}, { timezone: 'America/Sao_Paulo' });
+
+// Lembrete pré-consulta D-1 — roda todo dia às 9h BRT
+cron.schedule('0 9 * * *', () => {
+  console.log('[CRON] Disparando lembretes pré-consulta...');
+  enviarLembretes().catch(e => console.error('[CRON] Erro LEMBRETE:', e.message));
+}, { timezone: 'America/Sao_Paulo' });
+
+// Follow-up pós-consulta 30 dias — roda todo dia às 10h BRT
+cron.schedule('0 10 * * *', () => {
+  console.log('[CRON] Disparando follow-ups pós-consulta...');
+  enviarFollowups().catch(e => console.error('[CRON] Erro FOLLOWUP:', e.message));
+}, { timezone: 'America/Sao_Paulo' });
+
+// Reengajamento de pacientes dormentes — roda toda segunda às 10h BRT
+cron.schedule('0 10 * * 1', () => {
+  console.log('[CRON] Disparando reengajamento de dormentes...');
+  enviarReengajamentos().catch(e => console.error('[CRON] Erro REENGAJAMENTO:', e.message));
 }, { timezone: 'America/Sao_Paulo' });
