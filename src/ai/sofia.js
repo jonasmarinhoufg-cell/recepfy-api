@@ -62,41 +62,43 @@ const configCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
 async function getClinicConfig(clinicaId) {
-  const cached = configCache.get(clinicaId);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.data;
-
-  const [clinica, sofia, medicos, faqs, horarios] = await Promise.all([
-    supabase.from('clinicas').select('*').eq('id', clinicaId).single(),
-    supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).maybeSingle(),
-    supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
-    supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
-    supabase
-      .from('horarios_disponiveis')
-      .select('*, medicos(nome)')
-      .eq('clinica_id', clinicaId)
-      .eq('disponivel', true)
-      .gte('data_hora', new Date().toISOString())
-      .lte('data_hora', new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString())
-      .order('data_hora', { ascending: true })
-      .limit(60),
-  ]);
-
-  const data = {
-    clinica: clinica.data,
-    sofia: sofia.data,
-    medicos: medicos.data || [],
-    faqs: faqs.data || [],
-    horarios: (horarios.data || []).map(h => ({
-      ...h,
-      medico_nome: h.medicos?.nome,
-    })),
-  };
-
-  // Só armazena em cache se sofia_configs existir — sem config retenta na próxima chamada
-  if (data.sofia) {
-    configCache.set(clinicaId, { data, ts: Date.now() });
+  // Config estável (clínica, sofia, médicos, FAQs) — cacheada por 5 min
+  let cached = configCache.get(clinicaId);
+  if (!cached || Date.now() - cached.ts >= CACHE_TTL) {
+    const [clinica, sofia, medicos, faqs] = await Promise.all([
+      supabase.from('clinicas').select('*').eq('id', clinicaId).single(),
+      supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).maybeSingle(),
+      supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
+      supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
+    ]);
+    cached = {
+      data: {
+        clinica:  clinica.data,
+        sofia:    sofia.data,
+        medicos:  medicos.data || [],
+        faqs:     faqs.data || [],
+      },
+      ts: Date.now(),
+    };
+    // Só armazena em cache se sofia_configs existir — sem config retenta na próxima chamada
+    if (cached.data.sofia) configCache.set(clinicaId, cached);
   }
-  return data;
+
+  // Horários disponíveis — SEMPRE frescos do banco (disponibilidade muda a cada agendamento)
+  const { data: horariosData } = await supabase
+    .from('horarios_disponiveis')
+    .select('*, medicos(nome)')
+    .eq('clinica_id', clinicaId)
+    .eq('disponivel', true)
+    .gte('data_hora', new Date().toISOString())
+    .lte('data_hora', new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString())
+    .order('data_hora', { ascending: true })
+    .limit(60);
+
+  return {
+    ...cached.data,
+    horarios: (horariosData || []).map(h => ({ ...h, medico_nome: h.medicos?.nome })),
+  };
 }
 
 function invalidateCache(clinicaId) {
@@ -514,6 +516,9 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   }
 
   // Notificação WhatsApp pessoal do médico/profissional
+  if (!telefoneMedico) {
+    console.warn(`[Sofia] Notificação ao médico pulada — telefone não cadastrado (clinica_id: ${clinicaId})`);
+  }
   if (telefoneMedico && whaInstance) {
     try {
       const tel = normalizePhone(telefoneMedico);
@@ -685,7 +690,7 @@ function buildEstadoInjetado(estado, config, mensagemAtual = '', agendamentoRece
     if (!estado.horario) {
       linhas.push('✗ Novo horário: não escolhido ainda');
       linhas.push('');
-      linhas.push('➡ PRÓXIMA AÇÃO OBRIGATÓRIA: APRESENTE os horários disponíveis e PERGUNTE qual o paciente prefere para o REAGENDAMENTO');
+      linhas.push('➡ PRÓXIMA AÇÃO OBRIGATÓRIA: APRESENTE SOMENTE os horários da seção "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO" — copie-os literalmente, NUNCA invente — e PERGUNTE qual o paciente prefere para o REAGENDAMENTO');
     } else {
       linhas.push(`✓ Novo horário escolhido: "${estado.horario}"`);
       linhas.push('');
@@ -732,7 +737,7 @@ function buildEstadoInjetado(estado, config, mensagemAtual = '', agendamentoRece
     proximaAcao = 'APRESENTE os médicos disponíveis e PERGUNTE qual o paciente prefere';
   } else if (!estado.horario) {
     const med = !isProf && estado.medico ? ` do ${estado.medico}` : '';
-    proximaAcao = `APRESENTE os horários disponíveis${med} e PERGUNTE qual o paciente prefere`;
+    proximaAcao = `APRESENTE SOMENTE os horários da seção "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO"${med} — copie-os literalmente, NUNCA invente horários — e PERGUNTE qual o paciente prefere`;
   } else if (!estado.convenio) {
     proximaAcao = 'PERGUNTE se usa convênio ou é particular';
   } else {
