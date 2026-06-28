@@ -636,10 +636,15 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
 function extrairEstadoConversa(historico, mensagemAtual, paciente, config) {
   const isProf = config.clinica?.modalidade === 'profissional';
 
+  // Clínica com único médico ativo: pré-seleciona para não perguntar ao paciente
+  const medicoUnico = !isProf && config.medicos?.length === 1
+    ? config.medicos[0].nome
+    : null;
+
   const estado = {
     nome:        paciente?.nome     || null,
     motivo:      null,
-    medico:      isProf ? (config.clinica?.medico_nome || null) : null,
+    medico:      isProf ? (config.clinica?.medico_nome || null) : medicoUnico,
     horario:     null,
     convenio:    paciente?.convenio || null,
     reagendando: false,
