@@ -8,6 +8,7 @@ function parseResponse(text) {
     reagendamento: null,
     handoff:      false,
     listaEspera:  null,
+    urgencia:     null,
   };
 
   // Agendamento confirmado
@@ -54,6 +55,19 @@ function parseResponse(text) {
   if (text.includes('[HANDOFF_SOLICITADO]')) {
     result.handoff = true;
     result.message = text.replace('[HANDOFF_SOLICITADO]', '').trim();
+  }
+
+  // Urgência detectada (triagem)
+  const urgenciaMatch = text.match(/\[URGENCIA_DETECTADA:(.*?)\]/s);
+  if (urgenciaMatch) {
+    try {
+      result.urgencia = JSON.parse(urgenciaMatch[1]);
+      result.message = text.replace(/\[URGENCIA_DETECTADA:.*?\]/s, '').trim();
+    } catch (e) {
+      console.error('Erro ao parsear urgência:', e.message);
+      result.urgencia = { sintoma: 'não especificado', resumo: text };
+      result.message = text.replace(/\[URGENCIA_DETECTADA:.*?\]/s, '').trim();
+    }
   }
 
   // Lista de espera

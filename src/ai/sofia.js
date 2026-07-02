@@ -496,11 +496,12 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
     ? `${booking.nome} — reagendado de ${dataAnterior} → ${booking.data} às ${booking.hora}`
     : `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`;
   const { error: notifErr } = await supabase.from('notificacoes').insert({
-    clinica_id: clinicaId,
-    medico_id:  medicoId,
-    tipo:       'agendamento',
-    titulo:     isReagendamento ? 'Consulta reagendada pela Sofia' : 'Novo agendamento pela Sofia',
-    corpo:      notifCorpo,
+    clinica_id:  clinicaId,
+    medico_id:   medicoId,
+    paciente_id: pacienteId,
+    tipo:        'agendamento',
+    titulo:      isReagendamento ? 'Consulta reagendada pela Sofia' : 'Novo agendamento pela Sofia',
+    corpo:       notifCorpo,
   });
   if (notifErr) console.error('Erro ao criar notificação:', notifErr.message);
 
@@ -1002,11 +1003,14 @@ async function enviarReengajamentos() {
       if (!pac.telefone || !pac.clinica_id) continue;
 
       // Só envia se o paciente tem ao menos uma consulta realizada
+      // (busca a mais recente para personalizar a mensagem com o médico)
       const { data: historico } = await supabase
         .from('agendamentos')
-        .select('id')
+        .select('id, medicos(nome)')
         .eq('paciente_id', pac.id)
         .eq('status', 'realizado')
+        .order('data_hora', { ascending: false })
+        .limit(1)
         .maybeSingle();
       if (!historico) continue;
 
@@ -1030,13 +1034,16 @@ async function enviarReengajamentos() {
       const tel = normalizePhone(pac.telefone);
       if (!tel) continue;
 
-      const nome     = pac.nome ? pac.nome.split(' ')[0] : null;
-      const saudacao = nome ? `Oi, ${nome}!` : 'Oi!';
+      const nome       = pac.nome ? pac.nome.split(' ')[0] : null;
+      const saudacao   = nome ? `Oi, ${nome}!` : 'Oi!';
+      const medicoNome = historico.medicos?.nome;
 
       const msg = [
         `${saudacao} Como você está? 😊`,
         '',
-        `Faz um tempinho que não temos notícias suas por aqui, e passamos só para dar um oi e saber se está tudo bem.`,
+        medicoNome
+          ? `Faz um tempinho que não temos notícias suas desde sua consulta com ${medicoNome}, e passamos só para dar um oi e saber se está tudo bem.`
+          : `Faz um tempinho que não temos notícias suas por aqui, e passamos só para dar um oi e saber se está tudo bem.`,
         '',
         `Cuide-se! Se precisar de nós, estamos por aqui. 💙`,
       ].join('\n');
@@ -1207,11 +1214,55 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       const nomePaciente = paciente.nome || telefone;
       const contexto = resumo ? `\n\nContexto: ${resumo}` : '';
       await supabase.from('notificacoes').insert({
-        clinica_id: clinicaId,
+        clinica_id:  clinicaId,
+        paciente_id: paciente.id,
         tipo: 'handoff',
         titulo: 'Paciente precisa de atendimento humano',
         corpo: `${nomePaciente} (${telefone}) — "${mensagem}"${contexto}`,
       });
+    }
+
+    // 11b. Urgência — triagem detectou sinal de risco: encerra e notifica médico(s) com prioridade máxima
+    if (parsed.urgencia) {
+      await encerrarConversa(conversa.id, 'urgencia');
+      const nomePaciente = paciente.nome || telefone;
+      const sintoma = parsed.urgencia.sintoma || 'sinal de urgência';
+      const resumoUrg = parsed.urgencia.resumo || mensagem;
+
+      // Profissional: notifica ele mesmo. Clínica: notifica todos os médicos ativos.
+      const medicosParaNotificar = modalidade === 'profissional'
+        ? [{ id: null, telefone: config.clinica.telefone }]
+        : (config.medicos || []).filter(m => m.telefone);
+
+      for (const m of medicosParaNotificar) {
+        const { error: urgNotifErr } = await supabase.from('notificacoes').insert({
+          clinica_id:  clinicaId,
+          medico_id:   m.id || null,
+          paciente_id: paciente.id,
+          tipo:        'urgencia',
+          titulo:      '🚨 Possível urgência detectada',
+          corpo:       `${nomePaciente} (${telefone}) — ${sintoma}: "${resumoUrg}"`,
+        });
+        if (urgNotifErr) console.error('Erro ao criar notificação de urgência:', urgNotifErr.message);
+      }
+
+      try {
+        const { data: wha } = await supabase
+          .from('whatsapp_instancias').select('instance_name')
+          .eq('clinica_id', clinicaId).maybeSingle();
+        if (wha?.instance_name) {
+          for (const m of medicosParaNotificar) {
+            const tel = normalizePhone(m.telefone);
+            if (tel) {
+              await sendMessage(wha.instance_name, tel,
+                `🚨 *Possível urgência detectada pela Sofia*\n\n*Paciente:* ${nomePaciente}\n*Telefone:* ${telefone}\n*Sinal:* ${sintoma}\n*Relato:* "${resumoUrg}"\n\nO paciente já foi orientado a buscar socorro imediato. Considere ligar diretamente.`
+              );
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Erro ao notificar urgência via WhatsApp:', e.message);
+      }
     }
 
     // 12. Lista de espera
