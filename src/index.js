@@ -72,23 +72,11 @@ app.listen(PORT, () => {
   console.log(`Recepfy API rodando na porta ${PORT}`);
 });
 
-// NPS pós-consulta — roda todo dia às 19h BRT
-cron.schedule('0 19 * * *', () => {
-  console.log('[CRON] Disparando NPS pós-consulta...');
-  enviarNpsPendentes().catch(e => console.error('[CRON] Erro NPS:', e.message));
-}, { timezone: 'America/Sao_Paulo' });
-
-// Lembrete pré-consulta D-1 — roda todo dia às 9h BRT
-cron.schedule('0 9 * * *', () => {
-  console.log('[CRON] Disparando lembretes pré-consulta...');
-  enviarLembretes().catch(e => console.error('[CRON] Erro LEMBRETE:', e.message));
-}, { timezone: 'America/Sao_Paulo' });
-
-// Follow-up pós-consulta 30 dias — roda todo dia às 10h BRT
-cron.schedule('0 10 * * *', () => {
-  console.log('[CRON] Disparando follow-ups pós-consulta...');
-  enviarFollowups().catch(e => console.error('[CRON] Erro FOLLOWUP:', e.message));
-}, { timezone: 'America/Sao_Paulo' });
+// NPS, Lembrete D-1 e Follow-up são disparados pelos Vercel Crons do recepfy-web (FONTE ÚNICA —
+// os do web trazem o link /c/<token> que alimenta a confirmação de presença, a Fila viva e o
+// anti-falta). Desligados AQUI para não duplicar mensagem ao mesmo paciente (risco de ban do
+// número no WhatsApp). As funções seguem exportadas para uso manual/debug se necessário.
+// (Reengajamento e Recall NÃO têm equivalente no web — continuam rodando aqui, abaixo.)
 
 // Reengajamento de pacientes dormentes — roda toda segunda às 10h BRT
 cron.schedule('0 10 * * 1', () => {

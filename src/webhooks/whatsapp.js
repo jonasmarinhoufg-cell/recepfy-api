@@ -18,6 +18,24 @@ router.post('/whatsapp', async (req, res) => {
     const body = req.body;
 
     const ev = (body.event || '').toUpperCase().replace('.', '_');
+
+    // Queda de conexão em TEMPO REAL: antes esse evento era descartado e a única detecção era
+    // o health-check 1x/dia — a Sofia ficava "morta" por horas. Agora marca desconectada na hora
+    // (o painel reflete na hora e o health-check, mais frequente, dispara o alerta ao dono).
+    if (ev === 'CONNECTION_UPDATE') {
+      const st = String(body.data?.state || body.data?.connection || '').toLowerCase();
+      const instName = body.instance || body.data?.instance;
+      if (instName && st) {
+        const novo = st === 'open' ? 'conectada' : 'desconectada';
+        try {
+          await supabase.from('whatsapp_instancias')
+            .update({ status: novo, updated_at: new Date().toISOString() })
+            .eq('instance_name', instName);
+        } catch (e) { console.error('[conn-update]', e.message); }
+      }
+      return res.sendStatus(200);
+    }
+
     if (ev !== 'MESSAGES_UPSERT') {
       return res.sendStatus(200);
     }
