@@ -20,6 +20,18 @@ function buildPrompt(config, perfilPaciente = '') {
     emergencia_msg: 'Para emergências, ligue 192 (SAMU) ou vá à UPA mais próxima.',
   };
 
+  // ── Convênios (tabela nova) + preço particular ─────────────────────────────
+  const conveniosRich = config.convenios || [];
+  const precos = config.precosParticular || [];
+  const conveniosAceitos = conveniosRich.filter(c => c.aceito);
+  const conveniosNaoAceitos = conveniosRich.filter(c => !c.aceito).map(c => c.nome);
+  const conveniosListaText = conveniosAceitos.length
+    ? conveniosAceitos.map(c => `- ${c.nome}${c.planos?.length ? ' (' + c.planos.join(', ') + ')' : ''}${c.exige_autorizacao ? ' — exige autorização/guia prévia' : ''}`).join('\n')
+    : (sofia.convenios?.length ? sofia.convenios.map(c => `- ${c}`).join('\n') : '- Nenhum convênio cadastrado — atende particular');
+  const precosText = precos.length
+    ? precos.map(p => `- ${p.procedimento}: R$ ${Number(p.valor).toFixed(2).replace('.', ',')}`).join('\n')
+    : 'Nenhum preço particular cadastrado';
+
   // ── Tom de voz ─────────────────────────────────────────────────────────────
   const toneDesc = {
     caloroso:    'calorosa e próxima, como uma assistente atenciosa',
@@ -44,14 +56,14 @@ function buildPrompt(config, perfilPaciente = '') {
 - Endereço do consultório: ${clinica.endereco || 'não informado'}
 - Telefone: ${clinica.telefone || 'não informado'}
 - Horários de atendimento: ${clinica.horarios?.semana || 'não informado'}${clinica.horarios?.sabado ? ' | ' + clinica.horarios.sabado : ''}
-- Convênios aceitos: ${sofia.convenios?.join(', ') || 'consultar diretamente'}`
+- Convênios: ver a seção CONVÊNIOS E PARTICULAR abaixo`
     : `DADOS DA CLÍNICA:
 - Nome: ${clinica.nome}
 - Especialidade: ${clinica.especialidade || 'não informada'}
 - Endereço: ${clinica.endereco || 'não informado'}
 - Telefone: ${clinica.telefone || 'não informado'}
 - Horários de funcionamento: ${clinica.horarios?.semana || 'não informado'}${clinica.horarios?.sabado ? ' | ' + clinica.horarios.sabado : ''}
-- Convênios aceitos: ${sofia.convenios?.join(', ') || 'consultar clínica'}`;
+- Convênios: ver a seção CONVÊNIOS E PARTICULAR abaixo`;
 
   // ── Médicos disponíveis ─────────────────────────────────────────────────────
   // Para profissional, o único médico é ele mesmo
@@ -138,6 +150,18 @@ ${faqsText}
 AVISOS:
 ${avisosText}
 
+CONVÊNIOS E PARTICULAR:
+Convênios aceitos:
+${conveniosListaText}${conveniosNaoAceitos.length ? '\n\nNÃO aceitos (para esses, ofereça particular): ' + conveniosNaoAceitos.join(', ') : ''}
+
+Tabela de preço particular:
+${precosText}
+
+REGRA DE CONVÊNIO:
+- Se o paciente perguntar se você atende o convênio dele, confira a lista de aceitos acima. Se estiver lá, confirme. Se exigir autorização, avise que ele precisa trazer guia/autorização prévia.
+- Se o convênio dele NÃO está nos aceitos, não diga apenas "não atendemos": ofereça a consulta PARTICULAR com o valor da tabela acima e, se ele topar, siga o agendamento normalmente (registre o convênio como "Particular").
+- Nunca invente um convênio aceito nem um preço que não esteja na tabela acima.
+
 TRIAGEM DE URGÊNCIA — VERIFIQUE ANTES DE QUALQUER OUTRA COISA:
 Avalie GRAVIDADE e CONTEXTO, nunca só a presença de uma palavra. A mesma palavra pode ser rotina ou emergência
 dependendo da intensidade, duração e do que mais o paciente relatar. Não classifique como urgência só porque
@@ -202,6 +226,11 @@ FLUXO DE LISTA DE ESPERA:
 - Se o paciente aceitar, colete o nome (já conhecido do perfil se houver) e finalize com:
   [LISTA_ESPERA:{"nome":"...","medico":"...","motivo":"..."}]
 - Se o paciente recusar, sugira ligar para ${isProf ? 'o consultório' : 'a clínica'}: ${clinica.telefone || 'o número da clínica'}
+
+REGISTRO DE OPORTUNIDADE PERDIDA (marcador invisível ao paciente):
+- Sempre que você NÃO conseguir atender o que o paciente queria — o convênio dele não é aceito e ele não quis particular, a especialidade/exame não é oferecida aqui, ou não havia horário e ele recusou a lista de espera — feche a resposta com:
+  [DEMANDA_REPRIMIDA:{"tipo":"convenio|especialidade|horario|exame|outro","detalhe":"o que o paciente queria, em 1 frase curta"}]
+- Registre só demanda REAL (ele queria e não deu), nunca curiosidade. No máximo uma por conversa.
 
 HANDOFF:
 Se o paciente demonstrar urgência, confusão persistente ou necessidade especial, inclua ao final: [HANDOFF_SOLICITADO]

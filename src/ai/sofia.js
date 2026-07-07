@@ -65,11 +65,13 @@ async function getClinicConfig(clinicaId) {
   // Config estável (clínica, sofia, médicos, FAQs) — cacheada por 5 min
   let cached = configCache.get(clinicaId);
   if (!cached || Date.now() - cached.ts >= CACHE_TTL) {
-    const [clinica, sofia, medicos, faqs] = await Promise.all([
+    const [clinica, sofia, medicos, faqs, convenios, precos] = await Promise.all([
       supabase.from('clinicas').select('*').eq('id', clinicaId).single(),
       supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).maybeSingle(),
       supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
       supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
+      supabase.from('convenios').select('nome, planos, aceito, exige_autorizacao, observacao').eq('clinica_id', clinicaId),
+      supabase.from('precos_particular').select('procedimento, valor').eq('clinica_id', clinicaId),
     ]);
     cached = {
       data: {
@@ -77,6 +79,8 @@ async function getClinicConfig(clinicaId) {
         sofia:    sofia.data,
         medicos:  medicos.data || [],
         faqs:     faqs.data || [],
+        convenios: convenios.data || [],
+        precosParticular: precos.data || [],
       },
       ts: Date.now(),
     };
@@ -449,45 +453,57 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
 
   const dataHoraAgendamento = parseBookingDateTime(booking.data, booking.hora);
 
-  // #4 — Verifica race condition: slot ainda disponível antes de inserir
-  if (medicoId) {
-    const { data: slotCheck } = await supabase
-      .from('horarios_disponiveis')
-      .select('disponivel')
-      .eq('clinica_id', clinicaId)
-      .eq('data_hora', dataHoraAgendamento)
-      .eq('medico_id', medicoId)
-      .eq('disponivel', true)
-      .maybeSingle();
+  const origem = isReagendamento ? 'reagendamento' : 'sofia';
 
-    if (!slotCheck) {
-      console.warn(`[SOFIA] Slot já ocupado — clinica=${clinicaId} medico=${medicoId} data=${dataHoraAgendamento}`);
-      return { success: false, error: 'slot_taken' };
+  // Encontra o slot livre correspondente (mesmo inventário oferecido no prompt).
+  let slotQ = supabase.from('horarios_disponiveis').select('id')
+    .eq('clinica_id', clinicaId).eq('data_hora', dataHoraAgendamento).eq('disponivel', true);
+  slotQ = medicoId ? slotQ.eq('medico_id', medicoId) : slotQ.is('medico_id', null);
+  const { data: slot } = await slotQ.maybeSingle();
+
+  if (slot?.id) {
+    // Caminho TRANSACIONAL: book_slot ocupa o slot e insere a consulta num passo só —
+    // trava a corrida com o painel e com a fila de espera (o "primeiro a fechar leva").
+    const { data: bookData, error: rpcErr } = await supabase.rpc('book_slot', {
+      p_slot_id: slot.id, p_paciente_id: pacienteId,
+      p_motivo: booking.motivo || 'Consulta', p_origem: origem,
+    });
+    if (rpcErr) {
+      if (/slot_taken/i.test(rpcErr.message || '')) {
+        console.warn(`[SOFIA] slot_taken — clinica=${clinicaId} slot=${slot.id} data=${dataHoraAgendamento}`);
+        return { success: false, error: 'slot_taken' };
+      }
+      console.error('Erro book_slot:', rpcErr.message);
+      return { success: false, error: 'db_error' };
+    }
+    // book_slot não grava conversa_id/modalidade_conta — completa o registro aqui.
+    const agId = Array.isArray(bookData) ? bookData[0] : bookData;
+    if (agId) await supabase.from('agendamentos')
+      .update({ conversa_id: conversaId, modalidade_conta: modalidade }).eq('id', agId);
+  } else {
+    // Sem slot no inventário (encaixe/edge). Insere direto; o índice único parcial
+    // (medico_id, data_hora) do banco (migration 20260707) ainda barra o double-booking
+    // — unique_violation (23505) é tratado como slot_taken.
+    const { error } = await supabase.from('agendamentos').insert({
+      clinica_id: clinicaId,
+      paciente_id: pacienteId,
+      conversa_id: conversaId,
+      medico_id: medicoId,
+      data_hora: dataHoraAgendamento,
+      motivo: booking.motivo,
+      status: 'confirmado',
+      origem,
+      modalidade_conta: modalidade,
+    });
+    if (error) {
+      if (error.code === '23505') {
+        console.warn(`[SOFIA] conflito no índice anti-double-booking — data=${dataHoraAgendamento}`);
+        return { success: false, error: 'slot_taken' };
+      }
+      console.error('Erro ao salvar agendamento:', error.message);
+      return { success: false, error: 'db_error' };
     }
   }
-
-  const { error } = await supabase.from('agendamentos').insert({
-    clinica_id: clinicaId,
-    paciente_id: pacienteId,
-    conversa_id: conversaId,
-    medico_id: medicoId,
-    data_hora: dataHoraAgendamento,
-    motivo: booking.motivo,
-    status: 'confirmado',
-    origem: isReagendamento ? 'reagendamento' : 'sofia',
-    modalidade_conta: modalidade,
-  });
-
-  if (error) {
-    console.error('Erro ao salvar agendamento:', error.message);
-    return { success: false, error: 'db_error' };
-  }
-
-  // Marca o slot como indisponível para evitar duplo agendamento
-  let slotQ = supabase.from('horarios_disponiveis').update({ disponivel: false })
-    .eq('clinica_id', clinicaId).eq('data_hora', dataHoraAgendamento);
-  if (medicoId) slotQ = slotQ.eq('medico_id', medicoId);
-  await slotQ;
 
   // Notificação na plataforma
   // Nota: tipo usa sempre 'agendamento' para compatibilidade com o schema DB.
@@ -1061,7 +1077,28 @@ async function enviarReengajamentos() {
 
 // ─── LISTA DE ESPERA ──────────────────────────────────────────────────────────
 
-async function handleListaEspera(clinicaId, pacienteId, dados) {
+async function handleListaEspera(clinicaId, paciente, telefone, dados, config) {
+  // Resolve o médico preferido pelo nome (se o paciente indicou um).
+  let medicoId = null;
+  if (dados.medico && config?.medicos?.length) {
+    const busca = dados.medico.toLowerCase();
+    const m = config.medicos.find(x => x.nome.toLowerCase() === busca)
+      || config.medicos.find(x => x.nome.toLowerCase().includes(busca) || busca.includes(x.nome.toLowerCase()));
+    if (m) medicoId = m.id;
+  }
+
+  // PERSISTE na fila de espera — é o que o painel/engine usa para ofertar a vaga
+  // (link /fila/[token]) quando um horário cancela. Sem isso, a fila não existe de fato.
+  const { error: leErr } = await supabase.from('lista_espera').insert({
+    clinica_id:  clinicaId,
+    paciente_id: paciente.id,
+    nome:        dados.nome || paciente.nome || 'Paciente',
+    telefone:    (telefone || '').replace(/\D/g, ''),
+    medico_id:   medicoId,
+    observacao:  dados.motivo || null,
+  });
+  if (leErr) console.error('Erro ao inserir lista_espera:', leErr.message);
+
   const corpo = [
     dados.nome ? `Paciente: ${dados.nome}` : null,
     dados.medico ? `Médico preferido: ${dados.medico}` : null,
@@ -1077,7 +1114,7 @@ async function handleListaEspera(clinicaId, pacienteId, dados) {
 
   // Registra na memória do paciente para enriquecer futuras conversas
   const entrada = `Lista de espera em ${new Date().toLocaleDateString('pt-BR')}${dados.medico ? ` para ${dados.medico}` : ''}`;
-  await salvarMemoriaPaciente(pacienteId, entrada);
+  await salvarMemoriaPaciente(paciente.id, entrada);
 }
 
 // ─── FUNÇÃO PRINCIPAL ─────────────────────────────────────────────────────────
@@ -1267,7 +1304,24 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
 
     // 12. Lista de espera
     if (parsed.listaEspera) {
-      await handleListaEspera(clinicaId, paciente.id, parsed.listaEspera);
+      await handleListaEspera(clinicaId, paciente, telefone, parsed.listaEspera, config);
+    }
+
+    // 12b. Demanda reprimida — intenção que a Sofia não conseguiu atender (convênio fora,
+    //      especialidade/horário/exame indisponível). Alimenta o relatório de oportunidade
+    //      na aba Comercial do painel.
+    if (parsed.demandaReprimida) {
+      const d = parsed.demandaReprimida;
+      const tipo = ['convenio', 'especialidade', 'horario', 'exame', 'outro'].includes(d.tipo) ? d.tipo : 'outro';
+      const { error: dErr } = await supabase.from('demanda_reprimida').insert({
+        clinica_id: clinicaId,
+        tipo,
+        detalhe: d.detalhe || null,
+        paciente_telefone: telefone,
+        conversa_id: conversa.id,
+        valor_estimado: Number(d.valor) || 0,
+      });
+      if (dErr) console.error('Erro ao registrar demanda reprimida:', dErr.message);
     }
 
     // Salva a mensagem final da Sofia (pode ter sido corrigida em caso de slot_taken)

@@ -9,6 +9,7 @@ function parseResponse(text) {
     handoff:      false,
     listaEspera:  null,
     urgencia:     null,
+    demandaReprimida: null,
   };
 
   // Agendamento confirmado
@@ -78,6 +79,17 @@ function parseResponse(text) {
       result.message = text.replace(/\[LISTA_ESPERA:.*?\]/s, '').trim();
     } catch (e) {
       console.error('Erro ao parsear lista de espera:', e.message);
+    }
+  }
+
+  // Demanda reprimida (intenção que a Sofia não conseguiu atender)
+  const demandaMatch = text.match(/\[DEMANDA_REPRIMIDA:(.*?)\]/s);
+  if (demandaMatch) {
+    try {
+      result.demandaReprimida = JSON.parse(demandaMatch[1]);
+      result.message = text.replace(/\[DEMANDA_REPRIMIDA:.*?\]/s, '').trim();
+    } catch (e) {
+      console.error('Erro ao parsear demanda reprimida:', e.message);
     }
   }
 
