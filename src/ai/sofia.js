@@ -329,8 +329,9 @@ async function reagendarAgendamento(clinicaId, pacienteId, conversaId, booking, 
   // Salva o novo agendamento como reagendamento
   const result = await salvarAgendamento(clinicaId, pacienteId, conversaId, booking, modalidade, { isReagendamento: true, dataAnterior, pacienteTelefone });
 
-  // B2 — Se o novo slot estava ocupado, restaura o agendamento original para não deixar o paciente sem consulta
-  if (result?.error === 'slot_taken' && agendamentoAtual) {
+  // B2 — Se o novo agendamento FALHOU (slot ocupado OU erro de banco), restaura o original
+  // para não deixar o paciente sem consulta (o cancelamento do original já aconteceu acima).
+  if (!result?.success && agendamentoAtual) {
     await supabase.from('agendamentos')
       .update({ status: 'confirmado' })
       .eq('id', agendamentoAtual.id);
@@ -1289,6 +1290,10 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
         invalidateCache(clinicaId);
         finalMessage = 'Esse horário acabou de ser reservado por outro paciente. Veja os horários disponíveis e escolha outro.';
         // Não encerra a conversa — paciente precisará escolher novo slot
+      } else if (!result?.success) {
+        // Falha de banco (db_error): NÃO encerra como sucesso nem diz "confirmado" — nada foi gravado.
+        console.error(`[SOFIA] salvarAgendamento falhou (${result?.error || 'desconhecido'}) — clinica=${clinicaId} paciente=${paciente.id}`);
+        finalMessage = 'Tive um probleminha técnico para concluir seu agendamento agora. Pode tentar de novo em instantes? Se continuar, a recepção da clínica finaliza para você.';
       } else {
         // Fase 4 — conversão do recall: se este paciente tinha recall pendente, marca convertido
         // (a receita recorrente que aparece no painel, rotulada "estimado").
@@ -1318,6 +1323,10 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       if (result?.error === 'slot_taken') {
         invalidateCache(clinicaId);
         finalMessage = 'Esse horário acabou de ser reservado por outro paciente. Escolha outro horário para o reagendamento.';
+      } else if (!result?.success) {
+        // Falha de banco: a consulta original foi RESTAURADA (em reagendarAgendamento); não encerra como sucesso.
+        console.error(`[SOFIA] reagendarAgendamento falhou (${result?.error || 'desconhecido'}) — clinica=${clinicaId} paciente=${paciente.id}`);
+        finalMessage = 'Tive um probleminha técnico para concluir o reagendamento. Sua consulta anterior continua marcada — pode tentar de novo em instantes?';
       } else {
         await encerrarConversa(conversa.id, 'ia');
         gerarResumoConversa(conversa.id)

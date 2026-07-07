@@ -119,10 +119,12 @@ router.post('/whatsapp', async (req, res) => {
 
     res.sendStatus(200);
 
-    // Opt-out do recall (LGPD/CFM): "SAIR"/"PARAR" ANTES do LLM → registra e confirma, sem
-    // resposta livre. Match EXATO da mensagem normalizada — "vou sair 15h" NÃO silencia.
+    // Opt-out do recall (LGPD/CFM): "SAIR"/"PARAR"/"STOP" ANTES do LLM → registra e confirma,
+    // sem resposta livre. Match EXATO da mensagem normalizada — "vou sair 15h" NÃO silencia.
+    // NÃO inclui "CANCELAR": é a palavra natural para cancelar a CONSULTA — deve fluir para o
+    // processarMensagem (cancelamento), não descadastrar do recall nem virar no-show silencioso.
     const norm = (mensagem || '').trim().toUpperCase();
-    if (['SAIR', 'PARAR', 'STOP', 'CANCELAR'].includes(norm)) {
+    if (['SAIR', 'PARAR', 'STOP'].includes(norm)) {
       try {
         await supabase.from('pacientes').update({ recall_opt_out: true })
           .eq('clinica_id', instancia.clinica_id).eq('telefone', telefone);
