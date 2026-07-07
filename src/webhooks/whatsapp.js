@@ -119,6 +119,18 @@ router.post('/whatsapp', async (req, res) => {
 
     res.sendStatus(200);
 
+    // Opt-out do recall (LGPD/CFM): "SAIR"/"PARAR" ANTES do LLM → registra e confirma, sem
+    // resposta livre. Match EXATO da mensagem normalizada — "vou sair 15h" NÃO silencia.
+    const norm = (mensagem || '').trim().toUpperCase();
+    if (['SAIR', 'PARAR', 'STOP', 'CANCELAR'].includes(norm)) {
+      try {
+        await supabase.from('pacientes').update({ recall_opt_out: true })
+          .eq('clinica_id', instancia.clinica_id).eq('telefone', telefone);
+      } catch (e) { console.error('[optout]', e.message); }
+      await sendMessage(instanceName, telefone, 'Pronto! Você não vai mais receber nossos lembretes de retorno. Se precisar agendar, é só chamar quando quiser. 💙');
+      return;
+    }
+
     const delay = Math.floor(Math.random() * 3000) + 2000;
     await new Promise(resolve => setTimeout(resolve, delay));
     await sendTyping(instanceName, telefone);

@@ -1117,6 +1117,83 @@ async function handleListaEspera(clinicaId, paciente, telefone, dados, config) {
   await salvarMemoriaPaciente(paciente.id, entrada);
 }
 
+// ─── RECALL CLÍNICO ───────────────────────────────────────────────────────────
+// Convida pacientes ao retorno no vencimento clínico de uma consulta REALIZADA.
+// Toda a elegibilidade (protocolo APROVADO pelo médico, vencimento, janela, opt-out,
+// staleness, consulta-futura, dedup do ciclo, cooldown, teto por janela) vem resolvida
+// da VIEW recall_vencidos. O gate recall_config.ativo é aplicado AQUI (a view é pura).
+// Copy = SÓ o template aprovado pelo médico (sem geração livre). NÃO pré-reserva slot.
+async function enviarRecalls() {
+  // 1) Clínicas com recall LIGADO (o interruptor) + teto global/dia (reputação do número).
+  const { data: cfgs } = await supabase.from('recall_config').select('clinica_id, max_por_dia').eq('ativo', true);
+  if (!cfgs?.length) { console.log('[RECALL] Nenhuma clínica com recall ativo'); return; }
+  const ativos = cfgs.map(c => c.clinica_id);
+  const maxDia = Object.fromEntries(cfgs.map(c => [c.clinica_id, c.max_por_dia ?? 50]));
+
+  const { data: vencidos, error } = await supabase
+    .from('recall_vencidos').select('*').in('clinica_id', ativos).limit(500);
+  if (error) { console.error('[RECALL] Erro na view recall_vencidos:', error.message); return; }
+  if (!vencidos?.length) { console.log('[RECALL] Nenhum recall vencido'); return; }
+
+  console.log(`[RECALL] ${vencidos.length} elegível(is)`);
+  const enviadosHoje = {};
+
+  for (const r of vencidos) {
+    try {
+      enviadosHoje[r.clinica_id] = enviadosHoje[r.clinica_id] || 0;
+      if (enviadosHoje[r.clinica_id] >= (maxDia[r.clinica_id] || 50)) continue;   // teto global/dia
+
+      const [pacResult, whaResult] = await Promise.all([
+        supabase.from('pacientes').select('telefone, nome').eq('id', r.paciente_id).maybeSingle(),
+        supabase.from('whatsapp_instancias').select('instance_name').eq('clinica_id', r.clinica_id).maybeSingle(),
+      ]);
+      const pac = pacResult.data, wha = whaResult.data;
+      if (!pac?.telefone || !wha?.instance_name) continue;
+      const tel = normalizePhone(pac.telefone);
+      if (!tel) continue;
+
+      // Belt-and-suspenders: confirma que não surgiu consulta futura entre a view e o envio.
+      const { data: futuro } = await supabase.from('agendamentos').select('id')
+        .eq('paciente_id', r.paciente_id)
+        .gt('data_hora', new Date().toISOString())
+        .in('status', ['confirmado', 'aguardando']).maybeSingle();
+      if (futuro) continue;
+
+      // Renderiza o template APROVADO. Coringa (sem médico) → "nossa equipe", nunca nome individual.
+      const primeiro = pac.nome ? pac.nome.split(' ')[0] : 'Olá';
+      let msg = (r.mensagem_template || '')
+        .replace(/\{nome\}/g, primeiro)
+        .replace(/\{clinica\}/g, r.clinica_nome || 'nossa clínica')
+        .replace(/\{medico\}/g, r.medico_nome || 'nossa equipe')
+        .replace(/\{procedimento\}/g, r.procedimento || 'seu retorno');
+
+      // Sugere 1 horário concreto (SUGESTÃO — não reserva, não chama book_slot: segurar vaga p/ quem
+      // não responde vira no-show). Quando o paciente topar, o fluxo normal agenda pelo book_slot.
+      let slotQ = supabase.from('horarios_disponiveis').select('data_hora')
+        .eq('clinica_id', r.clinica_id).eq('disponivel', true).gt('data_hora', new Date().toISOString());
+      if (r.medico_id) slotQ = slotQ.eq('medico_id', r.medico_id);
+      const { data: slot } = await slotQ.order('data_hora', { ascending: true }).limit(1).maybeSingle();
+      if (slot) {
+        const quando = new Date(slot.data_hora).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+        msg += `\n\nTenho ${quando} disponível, quer que eu veja pra você? Se preferir outro dia, é só dizer.`;
+      }
+
+      await sendMessage(wha.instance_name, tel, msg);
+
+      // O INSERT no ledger É o marcador de "enviado" (o índice único do ciclo deduplica).
+      const { error: insErr } = await supabase.from('recall_envios').insert({
+        clinica_id: r.clinica_id, protocolo_id: r.protocolo_id, paciente_id: r.paciente_id,
+        medico_id: r.medico_id, agendamento_origem_id: r.agendamento_origem_id,
+        status: 'enviado', valor_estimado: r.valor_estimado ?? 0,
+      });
+      if (insErr) console.error('[RECALL] Erro no ledger:', insErr.message);
+      else enviadosHoje[r.clinica_id]++;
+    } catch (e) {
+      console.error('[RECALL] Erro ao processar item:', e.message);
+    }
+  }
+}
+
 // ─── FUNÇÃO PRINCIPAL ─────────────────────────────────────────────────────────
 
 async function processarMensagem(clinicaId, telefone, mensagem) {
@@ -1213,6 +1290,12 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
         finalMessage = 'Esse horário acabou de ser reservado por outro paciente. Veja os horários disponíveis e escolha outro.';
         // Não encerra a conversa — paciente precisará escolher novo slot
       } else {
+        // Fase 4 — conversão do recall: se este paciente tinha recall pendente, marca convertido
+        // (a receita recorrente que aparece no painel, rotulada "estimado").
+        supabase.from('recall_envios').update({ status: 'agendou' })
+          .eq('clinica_id', clinicaId).eq('paciente_id', paciente.id).eq('status', 'enviado')
+          .gte('enviado_em', new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString())
+          .then(({ error }) => { if (error) console.error('[RECALL] conversão:', error.message); });
         await encerrarConversa(conversa.id, 'ia');
         gerarResumoConversa(conversa.id)
           .then(r => salvarMemoriaPaciente(paciente.id, r))
@@ -1335,4 +1418,4 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
   }
 }
 
-module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos };
+module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls };

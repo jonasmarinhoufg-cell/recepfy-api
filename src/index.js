@@ -4,7 +4,7 @@ const cors = require('cors');
 const cron = require('node-cron');
 
 const whatsappWebhook = require('./webhooks/whatsapp');
-const { invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos } = require('./ai/sofia');
+const { invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls } = require('./ai/sofia');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -94,4 +94,11 @@ cron.schedule('0 10 * * *', () => {
 cron.schedule('0 10 * * 1', () => {
   console.log('[CRON] Disparando reengajamento de dormentes...');
   enviarReengajamentos().catch(e => console.error('[CRON] Erro REENGAJAMENTO:', e.message));
+}, { timezone: 'America/Sao_Paulo' });
+
+// Recall clínico por protocolo — roda todo dia às 11h BRT (deslocado dos outros p/ espalhar a carga
+// e nunca empilhar 2 mensagens no mesmo minuto). O gate recall_config.ativo é checado dentro.
+cron.schedule('0 11 * * *', () => {
+  console.log('[CRON] Disparando recalls de protocolo...');
+  enviarRecalls().catch(e => console.error('[CRON] Erro RECALL:', e.message));
 }, { timezone: 'America/Sao_Paulo' });
