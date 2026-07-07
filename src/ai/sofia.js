@@ -509,6 +509,13 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   // Notificação na plataforma
   // Nota: tipo usa sempre 'agendamento' para compatibilidade com o schema DB.
   // O campo titulo distingue novo agendamento de reagendamento.
+  // Nome configurado da assistente (para os textos que o médico lê); fallback 'Sofia'.
+  let nomeIA = 'Sofia';
+  try {
+    const { data: cfgIA } = await supabase.from('sofia_configs').select('nome_assistente').eq('clinica_id', clinicaId).maybeSingle();
+    if (cfgIA?.nome_assistente) nomeIA = cfgIA.nome_assistente;
+  } catch {}
+
   const notifCorpo = isReagendamento && dataAnterior
     ? `${booking.nome} — reagendado de ${dataAnterior} → ${booking.data} às ${booking.hora}`
     : `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`;
@@ -517,7 +524,7 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
     medico_id:   medicoId,
     paciente_id: pacienteId,
     tipo:        'agendamento',
-    titulo:      isReagendamento ? 'Consulta reagendada pela Sofia' : 'Novo agendamento pela Sofia',
+    titulo:      isReagendamento ? `Consulta reagendada pela ${nomeIA}` : `Novo agendamento pela ${nomeIA}`,
     corpo:       notifCorpo,
   });
   if (notifErr) console.error('Erro ao criar notificação:', notifErr.message);
@@ -541,7 +548,7 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
     try {
       const tel = normalizePhone(telefoneMedico);
       if (tel) {
-        const header = isReagendamento ? '🔄 *Reagendamento via Sofia*' : '📅 *Novo agendamento via Sofia*';
+        const header = isReagendamento ? `🔄 *Reagendamento via ${nomeIA}*` : `📅 *Novo agendamento via ${nomeIA}*`;
         const linhas = [header, ''];
         if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`);
         linhas.push(
@@ -1384,7 +1391,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
             const tel = normalizePhone(m.telefone);
             if (tel) {
               await sendMessage(wha.instance_name, tel,
-                `🚨 *Possível urgência detectada pela Sofia*\n\n*Paciente:* ${nomePaciente}\n*Telefone:* ${telefone}\n*Sinal:* ${sintoma}\n*Relato:* "${resumoUrg}"\n\nO paciente já foi orientado a buscar socorro imediato. Considere ligar diretamente.`
+                `🚨 *Possível urgência detectada pela ${config.sofia?.nome_assistente || 'Sofia'}*\n\n*Paciente:* ${nomePaciente}\n*Telefone:* ${telefone}\n*Sinal:* ${sintoma}\n*Relato:* "${resumoUrg}"\n\nO paciente já foi orientado a buscar socorro imediato. Considere ligar diretamente.`
               );
             }
           }
