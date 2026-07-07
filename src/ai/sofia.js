@@ -22,13 +22,15 @@ const BRT_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC-3
 // Converte data/hora do booking (strings em horário de Brasília) para ISO UTC
 function parseBookingDateTime(dataStr, horaStr) {
   const dateMatch = (dataStr || '').match(/(\d{1,2})\/(\d{1,2})/);
-  const timeMatch = (horaStr  || '').match(/(\d{1,2})[h:](\d{2})/i);
+  // Aceita hora com OU sem minutos: "14h", "14:30", "14" (minutos default 00).
+  // Antes, "14h" não casava e caía silenciosamente no default 08:00.
+  const timeMatch = (horaStr  || '').match(/(\d{1,2})(?:[h:](\d{2}))?/i);
   if (!dateMatch) return new Date().toISOString();
 
   const day     = parseInt(dateMatch[1]);
   const month   = parseInt(dateMatch[2]) - 1; // 0-indexed
   const hours   = timeMatch ? parseInt(timeMatch[1]) : 8;
-  const minutes = timeMatch ? parseInt(timeMatch[2]) : 0;
+  const minutes = (timeMatch && timeMatch[2]) ? parseInt(timeMatch[2]) : 0;
 
   const now  = new Date();
   let   year = now.getUTCFullYear();
@@ -449,6 +451,9 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
         todosMedicos[0];
       medicoId = match.id;
       telefoneMedico = match.telefone || null;
+      // A confirmação ao paciente deve refletir o médico REALMENTE gravado (evita
+      // "pediu Dr. X, foi agendado com o [0]" sem o paciente/clínica perceberem).
+      booking.medico = match.nome;
     }
   }
 
@@ -933,8 +938,9 @@ async function enviarFollowups() {
 
   const { data: agendamentos } = await supabase
     .from('agendamentos')
-    .select('id, clinica_id, paciente_id, data_hora, medicos(nome)')
+    .select('id, clinica_id, paciente_id, data_hora, medicos(nome), pacientes!inner(recall_opt_out)')
     .eq('status', 'realizado')
+    .eq('pacientes.recall_opt_out', false) // respeita o opt-out do paciente (LGPD)
     .gte('data_hora', de)
     .lte('data_hora', ate)
     .is('followup_enviado_em', null);
@@ -1013,6 +1019,7 @@ async function enviarReengajamentos() {
     .select('id, nome, telefone, clinica_id, reengajamento_enviado_em')
     .not('ultimo_contato', 'is', null)
     .lt('ultimo_contato', noventaDiasAtras)
+    .eq('recall_opt_out', false) // respeita o opt-out do paciente (LGPD)
     .or(`reengajamento_enviado_em.is.null,reengajamento_enviado_em.lt.${seisMesesAtras}`);
 
   if (!pacientes?.length) {
@@ -1233,6 +1240,21 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     if (handoffAtivo) {
       const conversa = await getOrCreateConversa(clinicaId, paciente.id);
       await salvarMensagem(conversa.id, 'user', mensagem);
+      // Override de segurança: mesmo em handoff (hold de 24h), um sinal claro de
+      // emergência não pode ficar sem orientação nem sem avisar a clínica.
+      const EMERGENCIA = /(dor no peito|aperto no peito|n[ãa]o consigo respirar|falta de ar|desmai|sangramento intenso|sangrando muito|\bavc\b|derrame|convuls)/i;
+      if (EMERGENCIA.test(mensagem || '')) {
+        const emergMsg = 'Pelo que você descreveu, procure atendimento de emergência AGORA: ligue 192 (SAMU) ou vá à UPA/pronto-socorro mais próximo. Já avisei a equipe da clínica.';
+        await salvarMensagem(conversa.id, 'assistant', emergMsg);
+        try {
+          await supabase.from('notificacoes').insert({
+            clinica_id: clinicaId, paciente_id: paciente.id, tipo: 'urgencia',
+            titulo: '🚨 Possível urgência (paciente em atendimento humano)',
+            corpo: `${paciente.nome || telefone} (${telefone}) durante handoff: "${mensagem}"`,
+          });
+        } catch (e) { console.error('[urgencia-handoff]', e.message); }
+        return emergMsg;
+      }
       const holdMsg = 'Nossa equipe vai te atender em breve. 🙏';
       await salvarMensagem(conversa.id, 'assistant', holdMsg);
       return holdMsg;
