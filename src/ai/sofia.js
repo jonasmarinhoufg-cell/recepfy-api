@@ -743,8 +743,11 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
     } else if (/conv[eê]nio|plano/i.test(prevTexto) && conteudo.length < 60) {
       estado.convenio = conteudo;
     } else if (/conv[eê]nio|plano/i.test(texto) && !/perguntar|informar|verificar/i.test(texto)) {
-      // Paciente menciona convênio espontaneamente
-      const plans = (config.sofia?.convenios || []);
+      // Paciente menciona convênio espontaneamente. Fonte = tabela rica `convenios`
+      // (nomes); o array legado sofia_configs.convenios só entra como rede de
+      // segurança para clínicas ainda não migradas (mesma regra do prompt.js).
+      const richNames = (config.convenios || []).map(c => c.nome).filter(Boolean);
+      const plans = richNames.length ? richNames : (config.sofia?.convenios || []);
       const matchPlan = plans.find(p => texto.includes(p.toLowerCase()));
       if (matchPlan) estado.convenio = matchPlan;
     }
