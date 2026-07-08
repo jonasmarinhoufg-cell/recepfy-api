@@ -99,7 +99,7 @@ async function getClinicConfig(clinicaId) {
     .gte('data_hora', new Date().toISOString())
     .lte('data_hora', new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString())
     .order('data_hora', { ascending: true })
-    .limit(60);
+    .limit(40); // poda: 40 slots (14 dias) bastam para ofertar sem inflar o bloco volátil
 
   return {
     ...cached.data,
@@ -163,7 +163,9 @@ function buildPerfilPaciente(paciente, agendamentoRecente) {
   }
 
   if (paciente.memoria) {
-    perfil += `\n\nHISTÓRICO DE ATENDIMENTOS ANTERIORES:\n${paciente.memoria}`;
+    // Poda de contexto: só o trecho mais RECENTE da memória (ela cresce por append,
+    // então o fim é o mais novo). Vai no bloco volátil do prompt, a preço cheio.
+    perfil += `\n\nHISTÓRICO DE ATENDIMENTOS ANTERIORES:\n${String(paciente.memoria).slice(-600)}`;
   }
 
   if (paciente.nome) {
@@ -238,15 +240,74 @@ async function getOrCreateConversa(clinicaId, pacienteId) {
 // ─── HISTÓRICO ───────────────────────────────────────────────────────────────
 // Limite de 8 mensagens — o perfil compensa o que o histórico curto não cobre
 
+// ─── FAIR-USE (teto de conversas/mês por plano) ──────────────────────────────
+// O custo de IA é linear por conversa e o preço do plano é fixo — sem teto, a clínica
+// pesada opera a margem negativa. Ao ATINGIR o teto, pausam SÓ as campanhas PROATIVAS
+// (recall/reengajamento/follow-up); o atendimento reativo ao paciente e o lembrete da
+// consulta marcada NUNCA param. Dono é avisado a 80% e a 100% (com sugestão de upgrade).
+const PLAN_CAPS = { solo: 300, solo_pro: 500, starter: 600, clinica: 1200, pro: 2500 };
+const CAP_PADRAO = 600;
+
+async function getUsoMensal(clinicaId) {
+  const inicioMes = new Date(); inicioMes.setDate(1); inicioMes.setHours(0, 0, 0, 0);
+  const { count } = await supabase.from('conversas')
+    .select('id', { count: 'exact', head: true })
+    .eq('clinica_id', clinicaId)
+    .gte('iniciada_em', inicioMes.toISOString());
+  return count || 0;
+}
+
+async function fairUseAtingido(clinicaId, planoCache = null) {
+  try {
+    let plano = planoCache;
+    if (!plano) {
+      const { data } = await supabase.from('clinicas').select('plano').eq('id', clinicaId).maybeSingle();
+      plano = data?.plano;
+    }
+    const cap = PLAN_CAPS[plano] || CAP_PADRAO;
+    const uso = await getUsoMensal(clinicaId);
+    return uso >= cap;
+  } catch { return false; } // na dúvida, não pausa (falha aberta a favor do cliente)
+}
+
+// Notificador diário: avisa o dono ao cruzar 80% e 100% do teto (dedup por mês via título).
+async function verificarFairUse() {
+  const { data: clinicas } = await supabase.from('clinicas')
+    .select('id, nome, plano').in('billing_status', ['active', 'trial']);
+  if (!clinicas?.length) return;
+  const mesRef = new Date().toISOString().slice(0, 7); // "2026-07" — âncora do dedup no título
+  for (const c of clinicas) {
+    try {
+      const cap = PLAN_CAPS[c.plano] || CAP_PADRAO;
+      const uso = await getUsoMensal(c.id);
+      const pct = Math.round((uso / cap) * 100);
+      if (pct < 80) continue;
+      const nivel = pct >= 100 ? 100 : 80;
+      const titulo = `Uso do plano: ${nivel}% do limite (${mesRef})`;
+      const { data: ja } = await supabase.from('notificacoes').select('id')
+        .eq('clinica_id', c.id).eq('titulo', titulo).limit(1).maybeSingle();
+      if (ja) continue;
+      await supabase.from('notificacoes').insert({
+        clinica_id: c.id, tipo: 'sistema', titulo,
+        corpo: nivel >= 100
+          ? `Sua clínica atingiu o limite de ${cap} conversas do plano neste mês (${uso}). As campanhas automáticas (recall, reativação, follow-up) ficam pausadas até o próximo mês — o atendimento aos pacientes continua normal. Para não pausar, considere um upgrade de plano.`
+          : `Sua clínica já usou ${pct}% do limite de ${cap} conversas do plano neste mês (${uso}). Ao atingir 100%, as campanhas automáticas pausam (o atendimento aos pacientes continua normal). Se o movimento cresceu, vale considerar um upgrade.`,
+      });
+    } catch (e) { console.error('[FAIR-USE]', e.message); }
+  }
+}
+
 async function getHistorico(conversaId) {
+  // ÚLTIMAS 20 (desc + reverse). O order ascending + limit pegava as PRIMEIRAS 20 —
+  // em conversa longa, o modelo deixava de ver justamente as mensagens mais recentes.
   const { data } = await supabase
     .from('mensagens')
     .select('role, conteudo')
     .eq('conversa_id', conversaId)
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
     .limit(20);
 
-  return (data || []).map(m => ({ role: m.role, content: m.conteudo }));
+  return (data || []).reverse().map(m => ({ role: m.role, content: m.conteudo }));
 }
 
 async function salvarMensagem(conversaId, role, conteudo, tokens = 0) {
@@ -1029,9 +1090,17 @@ async function enviarReengajamentos() {
 
   console.log(`[REENGAJAMENTO] Verificando ${pacientes.length} paciente(s)`);
 
+  // Fair-use: resolve uma vez por clínica (não por paciente)
+  const fairUseCache = new Map();
+  async function clinicaNoTeto(clinicaId) {
+    if (!fairUseCache.has(clinicaId)) fairUseCache.set(clinicaId, await fairUseAtingido(clinicaId));
+    return fairUseCache.get(clinicaId);
+  }
+
   for (const pac of pacientes) {
     try {
       if (!pac.telefone || !pac.clinica_id) continue;
+      if (await clinicaNoTeto(pac.clinica_id)) continue; // campanha proativa pausada no teto
 
       // Só envia se o paciente tem ao menos uma consulta realizada
       // (busca a mais recente para personalizar a mensagem com o médico)
@@ -1142,7 +1211,13 @@ async function enviarRecalls() {
   // 1) Clínicas com recall LIGADO (o interruptor) + teto global/dia (reputação do número).
   const { data: cfgs } = await supabase.from('recall_config').select('clinica_id, max_por_dia').eq('ativo', true);
   if (!cfgs?.length) { console.log('[RECALL] Nenhuma clínica com recall ativo'); return; }
-  const ativos = cfgs.map(c => c.clinica_id);
+  // Fair-use: clínica no teto do plano não dispara campanha proativa este mês.
+  const ativos = [];
+  for (const c of cfgs) {
+    if (await fairUseAtingido(c.clinica_id)) { console.log(`[RECALL] fair-use atingido — pulando clinica ${c.clinica_id}`); continue; }
+    ativos.push(c.clinica_id);
+  }
+  if (!ativos.length) { console.log('[RECALL] Todas as clínicas ativas estão no teto de fair-use'); return; }
   const maxDia = Object.fromEntries(cfgs.map(c => [c.clinica_id, c.max_por_dia ?? 50]));
 
   const { data: vencidos, error } = await supabase
@@ -1307,13 +1382,18 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     //    não cacheia (sem erro) — o medidor abaixo denuncia via cache_read=0 persistente.
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
+      max_tokens: 400, // respostas reais têm ~80-150 tok; 400 corta a cauda de dano sem truncar uso legítimo
       system: [
         { type: 'text', text: buildPromptFixo(config), cache_control: { type: 'ephemeral' } },
         { type: 'text', text: buildPromptVolatil(config, perfilPaciente) + '\n' + estadoInjetado },
       ],
-      messages: [...historico, { role: 'user', content: mensagem }],
+      // Poda: o MODELO vê as últimas 12 mensagens (o estado já resume a conversa inteira —
+      // extrairEstadoConversa continua recebendo as 20 completas, acima).
+      messages: [...historico.slice(-12), { role: 'user', content: mensagem }],
     });
+    if (response.stop_reason === 'max_tokens') {
+      console.warn(`[SOFIA] resposta truncada em max_tokens (clinica=${clinicaId}) — revisar se o caso é legítimo`);
+    }
 
     // Medidor de custo real (tabela ia_uso, migration 20260711): grava input/output/cache tokens
     // e o custo estimado por chamada — 93% do custo é input e era invisível (só se gravava output).
@@ -1489,4 +1569,4 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
   }
 }
 
-module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls };
+module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse };

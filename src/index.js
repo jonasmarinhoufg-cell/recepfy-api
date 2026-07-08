@@ -4,7 +4,7 @@ const cors = require('cors');
 const cron = require('node-cron');
 
 const whatsappWebhook = require('./webhooks/whatsapp');
-const { invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls } = require('./ai/sofia');
+const { invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse } = require('./ai/sofia');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -89,4 +89,11 @@ cron.schedule('0 10 * * 1', () => {
 cron.schedule('0 11 * * *', () => {
   console.log('[CRON] Disparando recalls de protocolo...');
   enviarRecalls().catch(e => console.error('[CRON] Erro RECALL:', e.message));
+}, { timezone: 'America/Sao_Paulo' });
+
+// Fair-use — avisa o dono ao cruzar 80%/100% do teto de conversas do plano (dedup por mês).
+// As campanhas proativas (recall/reengajamento/follow-up) pausam sozinhas ao atingir 100%.
+cron.schedule('0 12 * * *', () => {
+  console.log('[CRON] Verificando fair-use dos planos...');
+  verificarFairUse().catch(e => console.error('[CRON] Erro FAIR-USE:', e.message));
 }, { timezone: 'America/Sao_Paulo' });
