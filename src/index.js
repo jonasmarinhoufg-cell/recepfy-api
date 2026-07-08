@@ -3,6 +3,15 @@ const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 
+// Rede de segurança do processo: um erro não tratado NUNCA derruba a Sofia em silêncio.
+// (O Railway reinicia o processo se cair, mas o log alto é o que permite diagnosticar.)
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] unhandledRejection:', reason?.stack || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] uncaughtException:', err?.stack || err);
+});
+
 const whatsappWebhook = require('./webhooks/whatsapp');
 const { invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse } = require('./ai/sofia');
 

@@ -49,7 +49,9 @@ function formatBRT(isoString, opts = {}) {
   });
 }
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// maxRetries explícito: o SDK re-tenta sozinho (backoff exponencial) em 429/5xx/rede —
+// um soluço da API não pode derrubar a resposta ao paciente. Timeout de 60s por tentativa.
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, maxRetries: 3, timeout: 60 * 1000 });
 
 const supabase = createClient(
   process.env.SUPABASE_URL,

@@ -127,8 +127,25 @@ async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
     }
   }
   await sendTyping(instanceName, telefone);
-  const resposta = await processarMensagem(clinicaId, telefone, mensagem);
-  await sendMessage(instanceName, telefone, resposta);
+  try {
+    const resposta = await processarMensagem(clinicaId, telefone, mensagem);
+    await sendMessage(instanceName, telefone, resposta);
+  } catch (e) {
+    // Falha TOTAL (modelo + retries esgotados, ou envio impossível): nada some em silêncio.
+    // O paciente recebe um aviso honesto e a clínica uma notificação para assumir a conversa.
+    console.error('[buffer] falha total no processamento:', e.message);
+    try {
+      await sendMessage(instanceName, telefone,
+        'Tive um probleminha técnico agora. Já avisei a equipe da clínica — eles vão te responder por aqui. 🙏');
+    } catch { /* nem o fallback saiu — fica só a notificação */ }
+    try {
+      await supabase.from('notificacoes').insert({
+        clinica_id: clinicaId, tipo: 'handoff',
+        titulo: 'Resposta não entregue — assuma a conversa',
+        corpo: `Falha técnica ao responder ${telefone}. Última mensagem do paciente: "${String(mensagem).slice(0, 160)}"`,
+      });
+    } catch (e2) { console.error('[buffer] notificação de falha também falhou:', e2.message); }
+  }
 }
 
 router.post('/whatsapp', async (req, res) => {
@@ -165,7 +182,9 @@ router.post('/whatsapp', async (req, res) => {
     if (data?.key?.fromMe) return res.sendStatus(200);
     if (data?.key?.remoteJid?.includes('@g.us')) return res.sendStatus(200);
 
-    // Ignora mensagem já processada (Evolution pode disparar o mesmo evento duas vezes)
+    // Ignora mensagem já processada (Evolution pode disparar o mesmo evento duas vezes).
+    // Set em memória = fast-path; a tabela eventos_processados (migration 20260713) torna o
+    // dedup DURÁVEL entre restarts/deploys: INSERT antes de processar, conflito = já visto.
     const messageId = data?.key?.id;
     if (messageId) {
       if (processedMessageIds.has(messageId)) {
@@ -174,6 +193,21 @@ router.post('/whatsapp', async (req, res) => {
       }
       processedMessageIds.add(messageId);
       setTimeout(() => processedMessageIds.delete(messageId), 5 * 60 * 1000);
+      try {
+        const { error: dupErr } = await supabase.from('eventos_processados').insert({ id: messageId });
+        if (dupErr) {
+          if (dupErr.code === '23505') {
+            console.log('[webhook] Duplicado (persistente) ignorado:', messageId);
+            return res.sendStatus(200);
+          }
+          // Tabela ausente (migration pendente) ou outro erro → segue com o Set em memória.
+        } else if (Math.random() < 0.01) {
+          // Higiene oportunista (~1% das mensagens): apaga registros com mais de 48h.
+          supabase.from('eventos_processados').delete()
+            .lt('created_at', new Date(Date.now() - 48 * 3600 * 1000).toISOString())
+            .then(() => {}, () => {});
+        }
+      } catch { /* dedup persistente é best-effort */ }
     }
 
     const instanceName = body.instance;
