@@ -247,7 +247,8 @@ async function getOrCreateConversa(clinicaId, pacienteId) {
 // pesada opera a margem negativa. Ao ATINGIR o teto, pausam SÓ as campanhas PROATIVAS
 // (recall/reengajamento/follow-up); o atendimento reativo ao paciente e o lembrete da
 // consulta marcada NUNCA param. Dono é avisado a 80% e a 100% (com sugestão de upgrade).
-const PLAN_CAPS = { solo: 300, solo_pro: 500, starter: 600, clinica: 1200, pro: 2500 };
+// Espelho de src/lib/plans.ts do recepfy-web — ALINHAR ao mudar lá.
+const PLAN_CAPS = { solo: 300, solo_pro: 500, starter: 600, clinica: 1200, clinica_plan: 1200, clinica_plus: 1600, pro: 2500 };
 const CAP_PADRAO = 600;
 
 async function getUsoMensal(clinicaId) {
