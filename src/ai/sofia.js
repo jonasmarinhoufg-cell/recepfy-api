@@ -247,9 +247,33 @@ async function getOrCreateConversa(clinicaId, pacienteId) {
 // pesada opera a margem negativa. Ao ATINGIR o teto, pausam SÓ as campanhas PROATIVAS
 // (recall/reengajamento/follow-up); o atendimento reativo ao paciente e o lembrete da
 // consulta marcada NUNCA param. Dono é avisado a 80% e a 100% (com sugestão de upgrade).
-// Espelho de src/lib/plans.ts do recepfy-web — ALINHAR ao mudar lá.
+// Fonte dos caps: tabela planos_catalogo (editável pela aba Planos do admin no
+// recepfy-web, migration 20260721). O espelho estático abaixo virou FALLBACK —
+// vale quando a tabela ainda não existe ou o banco falha. Cache de 60s: mudança
+// de cap pela aba vale aqui em até 1 minuto.
 const PLAN_CAPS = { solo: 300, solo_pro: 500, starter: 600, clinica: 1200, clinica_plan: 1200, clinica_plus: 1600, pro: 2500 };
 const CAP_PADRAO = 600;
+
+let _capsCache = { at: 0, map: null };
+async function capsDoCatalogo() {
+  if (Date.now() - _capsCache.at < 60_000) return _capsCache.map;
+  let map = null;
+  try {
+    const { data } = await supabase.from('planos_catalogo').select('id, cap_conversas');
+    if (data?.length) {
+      map = {};
+      for (const p of data) map[p.id] = p.cap_conversas;
+    }
+  } catch { /* tabela ausente/erro → espelho estático */ }
+  _capsCache = { at: Date.now(), map };
+  return map;
+}
+
+async function capDoPlano(plano) {
+  const norm = plano === 'clinica_plan' ? 'clinica' : plano; // alias legado
+  const catalogo = await capsDoCatalogo();
+  return (catalogo && catalogo[norm]) || PLAN_CAPS[plano] || CAP_PADRAO;
+}
 
 async function getUsoMensal(clinicaId) {
   const inicioMes = new Date(); inicioMes.setDate(1); inicioMes.setHours(0, 0, 0, 0);
@@ -267,7 +291,7 @@ async function fairUseAtingido(clinicaId, planoCache = null) {
       const { data } = await supabase.from('clinicas').select('plano').eq('id', clinicaId).maybeSingle();
       plano = data?.plano;
     }
-    const cap = PLAN_CAPS[plano] || CAP_PADRAO;
+    const cap = await capDoPlano(plano);
     const uso = await getUsoMensal(clinicaId);
     return uso >= cap;
   } catch { return false; } // na dúvida, não pausa (falha aberta a favor do cliente)
@@ -281,7 +305,7 @@ async function verificarFairUse() {
   const mesRef = new Date().toISOString().slice(0, 7); // "2026-07" — âncora do dedup no título
   for (const c of clinicas) {
     try {
-      const cap = PLAN_CAPS[c.plano] || CAP_PADRAO;
+      const cap = await capDoPlano(c.plano);
       const uso = await getUsoMensal(c.id);
       const pct = Math.round((uso / cap) * 100);
       if (pct < 80) continue;
