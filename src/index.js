@@ -25,6 +25,12 @@ app.get('/', (req, res) => {
   res.json({ status: 200, message: 'Recepfy API funcionando!', version: '1.0.0' });
 });
 
+// Probe de saúde — usado pelo teste da aba Integrações do admin (recepfy-web)
+// e por monitores externos. Responde rápido e sem tocar em dependências.
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime_s: Math.round(process.uptime()) });
+});
+
 app.post('/cache/invalidate', (req, res) => {
   const { clinica_id } = req.body || {};
   if (clinica_id) invalidateCache(clinica_id);
