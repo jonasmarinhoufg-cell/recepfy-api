@@ -74,6 +74,20 @@ function checarCap(telefone) {
 // A janela de 3s também substitui o antigo delay "cosmético" aleatório de 2-5s.
 const DEBOUNCE_MS = 3000;
 const buffers = new Map(); // `${instanceName}|${telefone}` → { textos, timer, clinicaId }
+
+// Serialização por telefone: dois flushes do MESMO paciente nunca rodam em paralelo
+// (mensagem enviada durante um processamento espera a vez — elimina a corrida que
+// criava conversas duplicadas e respostas fora de ordem). Fila de promises por chave.
+const filaPorTelefone = new Map(); // key → Promise (cauda da fila)
+function enfileirar(key, fn) {
+  const cauda = (filaPorTelefone.get(key) || Promise.resolve())
+    .then(fn)
+    .catch(e => console.error('[fila]', e.message));
+  filaPorTelefone.set(key, cauda);
+  cauda.finally(() => { if (filaPorTelefone.get(key) === cauda) filaPorTelefone.delete(key); });
+  return cauda;
+}
+
 function agendarProcessamento(instanceName, clinicaId, telefone, texto) {
   const key = `${instanceName}|${telefone}`;
   let buf = buffers.get(key);
@@ -82,8 +96,7 @@ function agendarProcessamento(instanceName, clinicaId, telefone, texto) {
   if (buf.timer) clearTimeout(buf.timer);
   buf.timer = setTimeout(() => {
     buffers.delete(key);
-    processarBuffer(instanceName, buf.clinicaId, telefone, buf.textos.join('\n'))
-      .catch(e => console.error('[buffer]', e.message));
+    enfileirar(key, () => processarBuffer(instanceName, buf.clinicaId, telefone, buf.textos.join('\n')));
   }, DEBOUNCE_MS);
 }
 
