@@ -13,6 +13,111 @@ const supabase = createClient(
 // Deduplicação: evita reprocessar o mesmo evento enviado duas vezes pela Evolution API
 const processedMessageIds = new Set();
 
+// ── GATE DE PAGAMENTO/TRIAL ──────────────────────────────────────────────────
+// Clínica sem billing ativo NÃO consome IA (trial expirado/inadimplente = margem -100%:
+// cada mensagem custaria tokens sem nenhuma receita). O cron billing-check (web) já vira
+// trial>7d e active>30d para 'inactive' — aqui só honramos o status.
+const billingCache = new Map(); // clinicaId → { status, telefone, nome, exp } (TTL 60s)
+async function getBillingInfo(clinicaId) {
+  const hit = billingCache.get(clinicaId);
+  if (hit && hit.exp > Date.now()) return hit;
+  const { data } = await supabase.from('clinicas')
+    .select('billing_status, telefone, nome').eq('id', clinicaId).maybeSingle();
+  const info = {
+    status: data?.billing_status || 'trial',
+    telefone: data?.telefone || null,
+    nome: data?.nome || 'a clínica',
+    exp: Date.now() + 60 * 1000,
+  };
+  billingCache.set(clinicaId, info);
+  return info;
+}
+
+const suspensoAvisado = new Map();    // telefone → ts (aviso ao paciente no máx. 1x/6h)
+const suspensoNotificado = new Map(); // clinicaId → ts (notificação ao dono no máx. 1x/24h)
+async function responderSuspenso(instanceName, telefone, clinicaId, info) {
+  const now = Date.now();
+  if ((suspensoAvisado.get(telefone) || 0) < now - 6 * 3600 * 1000) {
+    suspensoAvisado.set(telefone, now);
+    await sendMessage(instanceName, telefone,
+      `O atendimento automático da ${info.nome} está temporariamente indisponível. ` +
+      `Por favor, entre em contato direto com a clínica${info.telefone ? ` pelo telefone ${info.telefone}` : ''}. 🙏`);
+  }
+  if ((suspensoNotificado.get(clinicaId) || 0) < now - 24 * 3600 * 1000) {
+    suspensoNotificado.set(clinicaId, now);
+    try {
+      await supabase.from('notificacoes').insert({
+        clinica_id: clinicaId, tipo: 'sistema',
+        titulo: 'Atendimento pausado — plano inativo',
+        corpo: 'Pacientes estão chamando no WhatsApp, mas o plano está inativo e a assistente não está respondendo. Regularize o pagamento no painel para reativar.',
+      });
+    } catch (e) { console.error('[gate-billing]', e.message); }
+  }
+}
+
+// ── CAP ANTI-FLOOD (por telefone/hora) ───────────────────────────────────────
+// Sem teto, um flood de mensagens (spam, bug, abuso) queima tokens sem limite.
+const CAP_MSGS_HORA = 30;
+const msgsHora = new Map(); // telefone → { n, resetAt }
+function checarCap(telefone) {
+  const now = Date.now();
+  let c = msgsHora.get(telefone);
+  if (!c || c.resetAt < now) { c = { n: 0, resetAt: now + 3600 * 1000 }; msgsHora.set(telefone, c); }
+  c.n++;
+  if (c.n <= CAP_MSGS_HORA) return 'ok';
+  return c.n === CAP_MSGS_HORA + 1 ? 'avisar' : 'silencio';
+}
+
+// ── DEBOUNCE POR TELEFONE ────────────────────────────────────────────────────
+// Agrega o "burst" de mensagens picadas ("oi" + "quero marcar" + "amanhã 10h") numa ÚNICA
+// chamada ao modelo — sem isto, cada balão paga o prompt inteiro (~3,7k tokens de system).
+// A janela de 3s também substitui o antigo delay "cosmético" aleatório de 2-5s.
+const DEBOUNCE_MS = 3000;
+const buffers = new Map(); // `${instanceName}|${telefone}` → { textos, timer, clinicaId }
+function agendarProcessamento(instanceName, clinicaId, telefone, texto) {
+  const key = `${instanceName}|${telefone}`;
+  let buf = buffers.get(key);
+  if (!buf) { buf = { textos: [], timer: null, clinicaId }; buffers.set(key, buf); }
+  buf.textos.push(texto);
+  if (buf.timer) clearTimeout(buf.timer);
+  buf.timer = setTimeout(() => {
+    buffers.delete(key);
+    processarBuffer(instanceName, buf.clinicaId, telefone, buf.textos.join('\n'))
+      .catch(e => console.error('[buffer]', e.message));
+  }, DEBOUNCE_MS);
+}
+
+// Confirmações/agradecimentos triviais FORA de conversa ativa → resposta fixa, sem tocar o
+// modelo (o "obrigado" pós-encerramento e o "ok" de resposta a lembrete custariam 1 chamada
+// Sonnet cheia cada). DENTRO de conversa ativa ("ok" confirmando um horário!) segue pro modelo.
+const TRIVIAL = /^(ok(ay)?|blz|beleza|obrigad[oa]s?|muito obrigad[oa]|valeu|certo|perfeito|combinado|confirmado|ta bom|tá bom|de nada|show|top|joia|jóia|tudo bem|👍|🙏|❤️|😊|👌)[\s.!,]*$/i;
+
+async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
+  if (TRIVIAL.test(mensagem.trim())) {
+    let temConversaAtiva = false;
+    try {
+      const { data: pac } = await supabase.from('pacientes').select('id')
+        .eq('clinica_id', clinicaId).eq('telefone', telefone).maybeSingle();
+      if (pac?.id) {
+        const { data: conv } = await supabase.from('conversas').select('id')
+          .eq('clinica_id', clinicaId).eq('paciente_id', pac.id).eq('status', 'ativa')
+          .limit(1).maybeSingle();
+        temConversaAtiva = !!conv;
+      }
+    } catch { /* na dúvida, segue pro modelo */ temConversaAtiva = true; }
+    if (!temConversaAtiva) {
+      const resposta = /obrigad|valeu|🙏/i.test(mensagem)
+        ? 'De nada! 😊 Precisando, é só chamar.'
+        : 'Combinado! 😊 Qualquer coisa, é só chamar.';
+      await sendMessage(instanceName, telefone, resposta);
+      return;
+    }
+  }
+  await sendTyping(instanceName, telefone);
+  const resposta = await processarMensagem(clinicaId, telefone, mensagem);
+  await sendMessage(instanceName, telefone, resposta);
+}
+
 router.post('/whatsapp', async (req, res) => {
   try {
     const body = req.body;
@@ -62,6 +167,22 @@ router.post('/whatsapp', async (req, res) => {
     const telefone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');
     if (!telefone) return res.sendStatus(200);
 
+    // Resolve a clínica UMA vez (todos os caminhos precisam) e aplica o gate de billing
+    // ANTES de qualquer custo (Whisper no áudio, Sonnet no texto).
+    const { data: instancia } = await supabase
+      .from('whatsapp_instancias').select('clinica_id')
+      .eq('instance_name', instanceName).maybeSingle();
+    if (!instancia) {
+      console.warn('[webhook] Instância não encontrada:', instanceName);
+      return res.sendStatus(200);
+    }
+    const billing = await getBillingInfo(instancia.clinica_id);
+    if (!['active', 'trial'].includes(billing.status)) {
+      res.sendStatus(200);
+      await responderSuspenso(instanceName, telefone, instancia.clinica_id, billing);
+      return;
+    }
+
     // Extrai texto de todos os tipos comuns de mensagem de texto
     const mensagem = data?.message?.conversation ||
                      data?.message?.extendedTextMessage?.text ||
@@ -74,25 +195,21 @@ router.post('/whatsapp', async (req, res) => {
                      data?.message?.viewOnceMessage?.message?.extendedTextMessage?.text ||
                      '';
 
-    // Áudio (voz ou arquivo de áudio) — transcreve com Whisper
+    // Áudio (voz ou arquivo de áudio) — transcreve com Whisper e entra no MESMO buffer
+    // do texto (áudio + balões de texto do mesmo burst viram uma única chamada ao modelo).
     const temAudio = data.message?.audioMessage || data.message?.pttMessage;
     if (!mensagem && temAudio) {
       res.sendStatus(200);
-      const { data: instancia } = await supabase
-        .from('whatsapp_instancias').select('clinica_id')
-        .eq('instance_name', instanceName).maybeSingle();
-      if (!instancia) { console.warn('[webhook] Instância não encontrada (áudio):', instanceName); return; }
-
+      const cap = checarCap(telefone);
+      if (cap === 'silencio') return;
+      if (cap === 'avisar') {
+        await sendMessage(instanceName, telefone, 'Recebemos muitas mensagens seguidas. Aguarde um momento antes de continuar, por favor. 🙏');
+        return;
+      }
       try {
         const transcricao = await transcribeAudioMessage(instanceName, data.key, data.message);
         if (!transcricao) throw new Error('Transcrição vazia');
-
-        const delay = Math.floor(Math.random() * 3000) + 2000;
-        await new Promise(r => setTimeout(r, delay));
-        await sendTyping(instanceName, telefone);
-
-        const resposta = await processarMensagem(instancia.clinica_id, telefone, transcricao);
-        await sendMessage(instanceName, telefone, resposta);
+        agendarProcessamento(instanceName, instancia.clinica_id, telefone, transcricao);
       } catch (e) {
         console.error('Erro ao transcrever áudio:', e);
         await new Promise(r => setTimeout(r, 1200));
@@ -113,26 +230,12 @@ router.post('/whatsapp', async (req, res) => {
       );
       res.sendStatus(200);
       if (temMidia) {
-        const { data: instancia } = await supabase
-          .from('whatsapp_instancias').select('clinica_id')
-          .eq('instance_name', instanceName).maybeSingle();
-        if (instancia) {
-          await new Promise(r => setTimeout(r, 1200));
-          await sendMessage(instanceName, telefone,
-            'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?'
-          );
-        }
+        await new Promise(r => setTimeout(r, 1200));
+        await sendMessage(instanceName, telefone,
+          'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?'
+        );
       }
       return;
-    }
-
-    const { data: instancia } = await supabase
-      .from('whatsapp_instancias').select('clinica_id')
-      .eq('instance_name', instanceName).maybeSingle();
-
-    if (!instancia) {
-      console.warn('[webhook] Instância não encontrada:', instanceName);
-      return res.sendStatus(200);
     }
 
     res.sendStatus(200);
@@ -151,12 +254,14 @@ router.post('/whatsapp', async (req, res) => {
       return;
     }
 
-    const delay = Math.floor(Math.random() * 3000) + 2000;
-    await new Promise(resolve => setTimeout(resolve, delay));
-    await sendTyping(instanceName, telefone);
-
-    const resposta = await processarMensagem(instancia.clinica_id, telefone, mensagem);
-    await sendMessage(instanceName, telefone, resposta);
+    // Cap anti-flood + debounce (a janela de 3s agrega o burst e já faz o papel do delay natural)
+    const cap = checarCap(telefone);
+    if (cap === 'silencio') return;
+    if (cap === 'avisar') {
+      await sendMessage(instanceName, telefone, 'Recebemos muitas mensagens seguidas. Aguarde um momento antes de continuar, por favor. 🙏');
+      return;
+    }
+    agendarProcessamento(instanceName, instancia.clinica_id, telefone, mensagem);
 
   } catch (error) {
     console.error('Erro no webhook:', error.message);

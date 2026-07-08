@@ -3,13 +3,18 @@
 // - 'clinica':       múltiplos médicos, recepcionista gerencia
 // - 'profissional':  médico autônomo, ele mesmo é o dono
 //
-// A diferença principal no prompt:
-// - Clínica: "Você é recepcionista da [clínica]"
-// - Profissional: "Você é assistente particular do [Dr. Nome]"
+// DIVIDIDO EM DUAS PARTES para o prompt caching da Anthropic (cache é prefix-match):
+// - buildPromptFixo(config):    tudo que só muda quando a clínica edita o cadastro
+//                               (identidade, fluxos, limites, médicos, FAQs, convênios).
+//                               ~3k tokens — vai com cache_control e vira cache read (10% do preço).
+// - buildPromptVolatil(config, perfilPaciente): o que muda por paciente/turno
+//                               (perfil, HORÁRIOS disponíveis) — fica DEPOIS do breakpoint.
+// O estadoInjetado (por turno) é anexado ao volátil no sofia.js, no FIM do system.
+// NUNCA adicione conteúdo volátil ao fixo: qualquer byte diferente invalida o cache inteiro.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildPrompt(config, perfilPaciente = '') {
-  const { clinica, medicos, faqs, horarios } = config;
+function buildPromptFixo(config) {
+  const { clinica, medicos, faqs } = config;
 
   // Fallback quando sofia_configs ainda não foi configurada pela clínica
   const sofia = config.sofia || {
@@ -78,45 +83,6 @@ function buildPrompt(config, perfilPaciente = '') {
     ? faqs.map(f => `P: ${f.pergunta}\nR: ${f.resposta}`).join('\n\n')
     : 'Nenhuma pergunta frequente cadastrada ainda';
 
-  // ── Horários disponíveis ───────────────────────────────────────────────────
-  // Para profissional: agrupa por data. Para clínica: agrupa por médico → data
-  // (paciente escolhe o médico primeiro, depois vê os slots daquele médico)
-  const horariosFormatados = horarios.length > 0
-    ? (() => {
-        const opts = { timeZone: 'America/Sao_Paulo' };
-        if (isProf) {
-          const porData = {};
-          horarios.forEach(h => {
-            const data = new Date(h.data_hora).toLocaleDateString('pt-BR', { ...opts, weekday: 'long', day: '2-digit', month: '2-digit' });
-            const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', { ...opts, hour: '2-digit', minute: '2-digit' });
-            if (!porData[data]) porData[data] = [];
-            porData[data].push(hora);
-          });
-          return Object.entries(porData)
-            .map(([data, horas]) => `${data}: ${horas.join(', ')}`)
-            .join('\n');
-        } else {
-          const porMedico = {};
-          horarios.forEach(h => {
-            const medico = h.medico_nome || 'Médico';
-            const data = new Date(h.data_hora).toLocaleDateString('pt-BR', { ...opts, weekday: 'long', day: '2-digit', month: '2-digit' });
-            const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', { ...opts, hour: '2-digit', minute: '2-digit' });
-            if (!porMedico[medico]) porMedico[medico] = {};
-            if (!porMedico[medico][data]) porMedico[medico][data] = [];
-            porMedico[medico][data].push(hora);
-          });
-          return Object.entries(porMedico)
-            .map(([medico, porData]) => {
-              const dias = Object.entries(porData)
-                .map(([data, horas]) => `  ${data}: ${horas.join(', ')}`)
-                .join('\n');
-              return `${medico}:\n${dias}`;
-            })
-            .join('\n\n');
-        }
-      })()
-    : 'Sem horários disponíveis no momento';
-
   // ── Avisos ─────────────────────────────────────────────────────────────────
   const avisosText = sofia.avisos?.length > 0
     ? sofia.avisos.map(a => `- ${a}`).join('\n')
@@ -136,15 +102,10 @@ Seja ${toneDesc}. Escreva de forma natural e direta no WhatsApp.
 
 TRANSPARÊNCIA (OBRIGATÓRIO — ética/CFM): na PRIMEIRA mensagem de cada conversa, deixe claro de forma leve que você é a assistente VIRTUAL (ex.: "Oi! Sou a ${sofia.nome_assistente}, assistente virtual da ${isProf ? (clinica.medico_nome || 'equipe') : clinica.nome} 🙂 Como posso ajudar?"). NUNCA finja ser uma pessoa; se perguntarem, confirme com naturalidade que é um atendimento por IA e que a equipe humana está por perto.
 
-${perfilPaciente}
-
 ${contextoClinica}
 
 ${isProf ? 'MÉDICO DISPONÍVEL:' : 'MÉDICOS DISPONÍVEIS:'}
 ${medicosText}
-
-HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO:
-${horariosFormatados}
 
 PERGUNTAS FREQUENTES:
 ${faqsText}
@@ -199,7 +160,7 @@ Se, com a informação disponível, os sinais indicarem risco real:
    onde "sintoma" é uma frase curta do sinal identificado e "resumo" é 1 frase do que o paciente relatou.
 
 FLUXO DE AGENDAMENTO:
-O estado do agendamento está no INÍCIO deste prompt (seção ESTADO ATUAL DO AGENDAMENTO).
+O estado do agendamento está no FIM deste prompt (seção ESTADO ATUAL DO AGENDAMENTO).
 Siga SOMENTE a "PRÓXIMA AÇÃO OBRIGATÓRIA" indicada lá — não invente passos, não repita perguntas marcadas com ✓.
 Quando todos os campos estiverem com ✓, mostre o resumo, peça confirmação e feche com:
 [AGENDAMENTO_CONFIRMADO:{"nome":"...","data":"...","hora":"...","medico":"...","motivo":"...","convenio":"..."}]
@@ -245,7 +206,7 @@ LIMITES ABSOLUTOS — NUNCA QUEBRE ESSAS REGRAS:
 - Em emergências responda apenas: "${emergMsg}"
 - Responda somente com base nas informações acima
 - Se não souber algo, diga diretamente e sugira ligar: ${clinica.telefone || 'o número da clínica'}
-- NUNCA invente, sugira ou mencione horários que não constem exatamente na lista "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO" acima. Apresente somente os slots listados, copiados literalmente. Se a lista estiver vazia ou disser "Sem horários disponíveis", informe o paciente e ofereça a lista de espera.
+- NUNCA invente, sugira ou mencione horários que não constem exatamente na lista "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO" (no fim deste prompt). Apresente somente os slots listados, copiados literalmente. Se a lista estiver vazia ou disser "Sem horários disponíveis", informe o paciente e ofereça a lista de espera.
 
 FORMATAÇÃO — USE APENAS NESTES DOIS CASOS:
 
@@ -280,4 +241,60 @@ ESTILO DE ESCRITA — restrições de forma, não mudam sua missão:
 - Nunca use negrito ou markdown fora dos dois modelos de formatação acima`;
 }
 
-module.exports = { buildPrompt };
+// ── Parte VOLÁTIL do system (fica DEPOIS do breakpoint de cache) ─────────────
+// Perfil do paciente (muda por paciente) + horários disponíveis (mudam a cada
+// agendamento). O estadoInjetado (por turno) é anexado depois disto, no sofia.js.
+function buildPromptVolatil(config, perfilPaciente = '') {
+  const { clinica, horarios } = config;
+  const isProf = clinica.modalidade === 'profissional';
+
+  // Para profissional: agrupa por data. Para clínica: agrupa por médico → data
+  // (paciente escolhe o médico primeiro, depois vê os slots daquele médico)
+  const horariosFormatados = horarios.length > 0
+    ? (() => {
+        const opts = { timeZone: 'America/Sao_Paulo' };
+        if (isProf) {
+          const porData = {};
+          horarios.forEach(h => {
+            const data = new Date(h.data_hora).toLocaleDateString('pt-BR', { ...opts, weekday: 'long', day: '2-digit', month: '2-digit' });
+            const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', { ...opts, hour: '2-digit', minute: '2-digit' });
+            if (!porData[data]) porData[data] = [];
+            porData[data].push(hora);
+          });
+          return Object.entries(porData)
+            .map(([data, horas]) => `${data}: ${horas.join(', ')}`)
+            .join('\n');
+        } else {
+          const porMedico = {};
+          horarios.forEach(h => {
+            const medico = h.medico_nome || 'Médico';
+            const data = new Date(h.data_hora).toLocaleDateString('pt-BR', { ...opts, weekday: 'long', day: '2-digit', month: '2-digit' });
+            const hora = new Date(h.data_hora).toLocaleTimeString('pt-BR', { ...opts, hour: '2-digit', minute: '2-digit' });
+            if (!porMedico[medico]) porMedico[medico] = {};
+            if (!porMedico[medico][data]) porMedico[medico][data] = [];
+            porMedico[medico][data].push(hora);
+          });
+          return Object.entries(porMedico)
+            .map(([medico, porData]) => {
+              const dias = Object.entries(porData)
+                .map(([data, horas]) => `  ${data}: ${horas.join(', ')}`)
+                .join('\n');
+              return `${medico}:\n${dias}`;
+            })
+            .join('\n\n');
+        }
+      })()
+    : 'Sem horários disponíveis no momento';
+
+  return `${perfilPaciente}
+
+HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO:
+${horariosFormatados}`;
+}
+
+// Compat: o prompt completo numa string só (fixo + volátil), para quem não usa cache.
+function buildPrompt(config, perfilPaciente = '') {
+  return buildPromptFixo(config) + '\n\n' + buildPromptVolatil(config, perfilPaciente);
+}
+
+module.exports = { buildPrompt, buildPromptFixo, buildPromptVolatil };

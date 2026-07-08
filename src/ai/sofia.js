@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const Anthropic = require('@anthropic-ai/sdk');
-const { buildPrompt } = require('./prompt');
+const { buildPrompt, buildPromptFixo, buildPromptVolatil } = require('./prompt');
 const { parseResponse } = require('./parser');
 const { createClient } = require('@supabase/supabase-js');
 const { sendMessage } = require('../whatsapp/sender');
@@ -1297,13 +1297,46 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     // 5. Salva mensagem do paciente ANTES de processar
     await salvarMensagem(conversa.id, 'user', mensagem);
 
-    // 6. Envia para Claude — estado vai NO INÍCIO do system prompt (maior atenção do modelo)
+    // 6. Envia para Claude com PROMPT CACHING (corta ~90% do custo do prefixo repetido):
+    //    - bloco 1 (FIXO por clínica, ~3k tok): identidade/fluxos/limites/médicos/FAQs/convênios,
+    //      com cache_control — vira cache read (10% do preço) nas chamadas seguintes (TTL 5 min,
+    //      renovado a cada uso; compartilhado entre TODOS os pacientes da mesma clínica).
+    //    - bloco 2 (VOLÁTIL): perfil do paciente + horários + estado do agendamento, DEPOIS do
+    //      breakpoint — mudar aqui não invalida o cache do fixo. O estado vai no FIM (recência).
+    //    Se o fixo de uma clínica ficar abaixo do mínimo cacheável (2.048 tok), a API simplesmente
+    //    não cacheia (sem erro) — o medidor abaixo denuncia via cache_read=0 persistente.
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1000,
-      system: estadoInjetado + '\n\n' + buildPrompt(config, perfilPaciente),
+      system: [
+        { type: 'text', text: buildPromptFixo(config), cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: buildPromptVolatil(config, perfilPaciente) + '\n' + estadoInjetado },
+      ],
       messages: [...historico, { role: 'user', content: mensagem }],
     });
+
+    // Medidor de custo real (tabela ia_uso, migration 20260711): grava input/output/cache tokens
+    // e o custo estimado por chamada — 93% do custo é input e era invisível (só se gravava output).
+    // Fire-and-forget e resiliente a migration pendente: nunca atrasa nem quebra a resposta.
+    try {
+      const u = response.usage || {};
+      const custoUsd = ((u.input_tokens || 0) * 3 + (u.output_tokens || 0) * 15
+        + (u.cache_creation_input_tokens || 0) * 3.75 + (u.cache_read_input_tokens || 0) * 0.30) / 1e6;
+      supabase.from('ia_uso').insert({
+        clinica_id: clinicaId, conversa_id: conversa.id, modelo: 'claude-sonnet-4-6',
+        input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0,
+        cache_write_tokens: u.cache_creation_input_tokens || 0,
+        cache_read_tokens: u.cache_read_input_tokens || 0,
+        custo_usd: Number(custoUsd.toFixed(6)),
+      }).then(({ error }) => {
+        if (error && !/PGRST205|does not exist|schema cache/i.test(error.message || '')) console.error('[IA-USO]', error.message);
+      });
+      // Sentinela do caching: input alto sem NENHUM cache (nem write nem read) = prefixo abaixo
+      // do mínimo cacheável ou regressão na ordem do prompt — os R$ do caching sumindo em silêncio.
+      if ((u.cache_read_input_tokens || 0) === 0 && (u.cache_creation_input_tokens || 0) === 0 && (u.input_tokens || 0) > 3000) {
+        console.warn(`[IA-USO] cache inativo (input=${u.input_tokens}, clinica=${clinicaId}) — verificar tamanho/ordem do prompt fixo`);
+      }
+    } catch (e) { console.error('[IA-USO]', e.message); }
 
     const rawText = response.content.map(b => b.text || '').join('');
     const parsed = parseResponse(rawText);
