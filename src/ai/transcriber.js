@@ -6,7 +6,10 @@ let _openai = null;
 function getOpenAI() {
   if (!_openai) {
     if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY não configurada no Railway')
-    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    // timeout/maxRetries explícitos: sem isso o SDK espera ~10min por padrão, e um Whisper
+    // pendurado deixa o paciente no vácuo (o fallback "não consegui ouvir" só dispara quando
+    // a chamada resolve). 20s por tentativa, 1 retry → pior caso ~40s antes do fallback.
+    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 20000, maxRetries: 1 })
   }
   return _openai
 }
