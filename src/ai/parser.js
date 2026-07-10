@@ -10,6 +10,7 @@ function parseResponse(text) {
     listaEspera:  null,
     urgencia:     null,
     demandaReprimida: null,
+    duvidaSemResposta: null,
   };
 
   // Agendamento confirmado
@@ -22,7 +23,7 @@ function parseResponse(text) {
         console.error('AGENDAMENTO_CONFIRMADO com campos faltando:', faltando, b);
       } else {
         result.booking = b;
-        result.message = text.replace(/\[AGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+        result.message = result.message.replace(/\[AGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
       }
     } catch (e) {
       console.error('Erro ao parsear agendamento:', e.message);
@@ -39,7 +40,7 @@ function parseResponse(text) {
         console.error('REAGENDAMENTO_CONFIRMADO com campos faltando:', faltando, r);
       } else {
         result.reagendamento = r;
-        result.message = text.replace(/\[REAGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
+        result.message = result.message.replace(/\[REAGENDAMENTO_CONFIRMADO:.*?\]/s, '').trim();
       }
     } catch (e) {
       console.error('Erro ao parsear reagendamento:', e.message);
@@ -49,13 +50,13 @@ function parseResponse(text) {
   // Cancelamento confirmado
   if (text.includes('[CANCELAMENTO_CONFIRMADO]')) {
     result.cancelamento = true;
-    result.message = text.replace('[CANCELAMENTO_CONFIRMADO]', '').trim();
+    result.message = result.message.replace('[CANCELAMENTO_CONFIRMADO]', '').trim();
   }
 
   // Handoff para humano
   if (text.includes('[HANDOFF_SOLICITADO]')) {
     result.handoff = true;
-    result.message = text.replace('[HANDOFF_SOLICITADO]', '').trim();
+    result.message = result.message.replace('[HANDOFF_SOLICITADO]', '').trim();
   }
 
   // Urgência detectada (triagem)
@@ -63,11 +64,11 @@ function parseResponse(text) {
   if (urgenciaMatch) {
     try {
       result.urgencia = JSON.parse(urgenciaMatch[1]);
-      result.message = text.replace(/\[URGENCIA_DETECTADA:.*?\]/s, '').trim();
+      result.message = result.message.replace(/\[URGENCIA_DETECTADA:.*?\]/s, '').trim();
     } catch (e) {
       console.error('Erro ao parsear urgência:', e.message);
       result.urgencia = { sintoma: 'não especificado', resumo: text };
-      result.message = text.replace(/\[URGENCIA_DETECTADA:.*?\]/s, '').trim();
+      result.message = result.message.replace(/\[URGENCIA_DETECTADA:.*?\]/s, '').trim();
     }
   }
 
@@ -76,7 +77,7 @@ function parseResponse(text) {
   if (listaEsperaMatch) {
     try {
       result.listaEspera = JSON.parse(listaEsperaMatch[1]);
-      result.message = text.replace(/\[LISTA_ESPERA:.*?\]/s, '').trim();
+      result.message = result.message.replace(/\[LISTA_ESPERA:.*?\]/s, '').trim();
     } catch (e) {
       console.error('Erro ao parsear lista de espera:', e.message);
     }
@@ -87,9 +88,24 @@ function parseResponse(text) {
   if (demandaMatch) {
     try {
       result.demandaReprimida = JSON.parse(demandaMatch[1]);
-      result.message = text.replace(/\[DEMANDA_REPRIMIDA:.*?\]/s, '').trim();
+      result.message = result.message.replace(/\[DEMANDA_REPRIMIDA:.*?\]/s, '').trim();
     } catch (e) {
       console.error('Erro ao parsear demanda reprimida:', e.message);
+    }
+  }
+
+  // Dúvida sem resposta — pergunta legítima que o prompt não cobre; vira
+  // notificação para a clínica completar o cadastro/responder o paciente.
+  // Regex exige o objeto completo {…} antes do ']' — um colchete dentro da
+  // pergunta não trunca o strip (defeito dos regex lazy dos outros marcadores).
+  const duvidaMatch = text.match(/\[DUVIDA_SEM_RESPOSTA:(\{.*?\})\]/s);
+  if (duvidaMatch) {
+    try {
+      result.duvidaSemResposta = JSON.parse(duvidaMatch[1]);
+      result.message = result.message.replace(/\[DUVIDA_SEM_RESPOSTA:\{.*?\}\]/s, '').trim();
+    } catch (e) {
+      console.error('Erro ao parsear dúvida sem resposta:', e.message);
+      result.message = result.message.replace(/\[DUVIDA_SEM_RESPOSTA:\{.*?\}\]/s, '').trim();
     }
   }
 

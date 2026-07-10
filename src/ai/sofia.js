@@ -167,7 +167,7 @@ function buildPerfilPaciente(paciente, agendamentoRecente) {
   if (paciente.memoria) {
     // Poda de contexto: só o trecho mais RECENTE da memória (ela cresce por append,
     // então o fim é o mais novo). Vai no bloco volátil do prompt, a preço cheio.
-    perfil += `\n\nHISTÓRICO DE ATENDIMENTOS ANTERIORES:\n${String(paciente.memoria).slice(-600)}`;
+    perfil += `\n\nHISTÓRICO DE ATENDIMENTOS ANTERIORES (uso interno — não recite ao paciente):\n${String(paciente.memoria).slice(-600)}`;
   }
 
   if (paciente.nome) {
@@ -334,7 +334,14 @@ async function getHistorico(conversaId) {
     .order('created_at', { ascending: false })
     .limit(20);
 
-  return (data || []).reverse().map(m => ({ role: m.role, content: m.conteudo }));
+  // A API da Anthropic só aceita role user/assistant. Resposta da recepção pelo painel
+  // é salva com role='humano' — para o modelo ela É fala do lado da clínica (assistant).
+  // Sem este mapeamento, uma resposta humana em conversa ativa gera 400 em TODA chamada
+  // seguinte e a Sofia trava no fallback de erro até a mensagem sair da janela.
+  return (data || []).reverse().map(m => ({
+    role: m.role === 'user' ? 'user' : 'assistant',
+    content: m.conteudo,
+  }));
 }
 
 async function salvarMensagem(conversaId, role, conteudo, tokens = 0) {
@@ -1586,6 +1593,34 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
         valor_estimado: Number(d.valor) || 0,
       });
       if (dErr) console.error('Erro ao registrar demanda reprimida:', dErr.message);
+    }
+
+    // 12c. Dúvida sem resposta — a Sofia não soube responder algo legítimo. Diferente do
+    //      handoff, a conversa SEGUE normal; só avisa a clínica para responder o paciente
+    //      ou completar o cadastro (FAQ/Comercial). Sem isso, o paciente sai sem resposta
+    //      e a clínica nunca fica sabendo.
+    if (parsed.duvidaSemResposta) {
+      // Dedup: o marcador é stripado antes de salvar, então o modelo não "lembra" que já
+      // o emitiu — sem esta trava, a mesma dúvida reformulada geraria 1 notificação por turno.
+      const { data: jaNotificado } = await supabase.from('notificacoes')
+        .select('id')
+        .eq('clinica_id', clinicaId)
+        .eq('paciente_id', paciente.id)
+        .eq('titulo', 'Sofia não soube responder')
+        .gte('created_at', new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString())
+        .limit(1)
+        .maybeSingle();
+      if (!jaNotificado) {
+        const pergunta = String(parsed.duvidaSemResposta.pergunta || mensagem).slice(0, 300);
+        const { error: dsErr } = await supabase.from('notificacoes').insert({
+          clinica_id:  clinicaId,
+          paciente_id: paciente.id,
+          tipo: 'handoff',
+          titulo: 'Sofia não soube responder',
+          corpo: `${paciente.nome || telefone} (${telefone}) perguntou: "${pergunta}". Responda pelo painel ou complete o cadastro (FAQs, convênios, preços) para a próxima vez.`,
+        });
+        if (dsErr) console.error('Erro ao registrar dúvida sem resposta:', dsErr.message);
+      }
     }
 
     // Salva a mensagem final da Sofia (pode ter sido corrigida em caso de slot_taken)
