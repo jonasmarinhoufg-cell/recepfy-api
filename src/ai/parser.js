@@ -83,14 +83,17 @@ function parseResponse(text) {
     }
   }
 
-  // Demanda reprimida (intenção que a Sofia não conseguiu atender)
-  const demandaMatch = text.match(/\[DEMANDA_REPRIMIDA:(.*?)\]/s);
+  // Demanda reprimida (intenção que a Sofia não conseguiu atender).
+  // Regex exige o objeto {…} completo (mesmo padrão do DUVIDA_SEM_RESPOSTA):
+  // um ']' dentro do detalhe não trunca o JSON nem vaza a tag pro paciente.
+  const demandaMatch = text.match(/\[DEMANDA_REPRIMIDA:(\{.*?\})\]/s);
   if (demandaMatch) {
     try {
       result.demandaReprimida = JSON.parse(demandaMatch[1]);
-      result.message = result.message.replace(/\[DEMANDA_REPRIMIDA:.*?\]/s, '').trim();
+      result.message = result.message.replace(/\[DEMANDA_REPRIMIDA:\{.*?\}\]/s, '').trim();
     } catch (e) {
       console.error('Erro ao parsear demanda reprimida:', e.message);
+      result.message = result.message.replace(/\[DEMANDA_REPRIMIDA:\{.*?\}\]/s, '').trim();
     }
   }
 

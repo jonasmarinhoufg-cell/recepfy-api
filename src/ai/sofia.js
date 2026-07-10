@@ -75,7 +75,7 @@ async function getClinicConfig(clinicaId) {
       supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
       supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
       supabase.from('convenios').select('nome, planos, aceito, exige_autorizacao, observacao').eq('clinica_id', clinicaId),
-      supabase.from('precos_particular').select('procedimento, valor').eq('clinica_id', clinicaId),
+      supabase.from('precos_particular').select('procedimento, valor, observacao').eq('clinica_id', clinicaId),
     ]);
     cached = {
       data: {
@@ -823,7 +823,7 @@ function buildEstadoInjetado(estado, config, mensagemAtual = '', agendamentoRece
     if (!estado.horario) {
       linhas.push('✗ Novo horário: não escolhido ainda');
       linhas.push('');
-      linhas.push('➡ PRÓXIMA AÇÃO OBRIGATÓRIA: APRESENTE SOMENTE os horários da seção "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO" — copie-os literalmente, NUNCA invente — e PERGUNTE qual o paciente prefere para o REAGENDAMENTO');
+      linhas.push('➡ PRÓXIMA AÇÃO OBRIGATÓRIA: APRESENTE ATÉ 3 horários da seção "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO" (se a lista for grande e o paciente não indicou período, PERGUNTE antes se prefere manhã ou tarde) — copie-os literalmente, NUNCA invente — e PERGUNTE qual o paciente prefere para o REAGENDAMENTO');
     } else {
       linhas.push(`✓ Novo horário escolhido: "${estado.horario}"`);
       linhas.push('');
@@ -870,7 +870,7 @@ function buildEstadoInjetado(estado, config, mensagemAtual = '', agendamentoRece
     proximaAcao = 'APRESENTE os médicos disponíveis e PERGUNTE qual o paciente prefere';
   } else if (!estado.horario) {
     const med = !isProf && estado.medico ? ` do ${estado.medico}` : '';
-    proximaAcao = `APRESENTE SOMENTE os horários da seção "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO"${med} — copie-os literalmente, NUNCA invente horários — e PERGUNTE qual o paciente prefere`;
+    proximaAcao = `APRESENTE ATÉ 3 horários da seção "HORÁRIOS DISPONÍVEIS PARA AGENDAMENTO"${med}, os mais próximos do período que o paciente indicou (se a lista for grande e ele não indicou período, PERGUNTE antes se prefere manhã ou tarde) — copie-os literalmente, NUNCA invente horários nem confirme horário proposto que não esteja na lista — e PERGUNTE qual o paciente prefere`;
   } else if (!estado.convenio) {
     proximaAcao = 'PERGUNTE se usa convênio ou é particular';
   } else {
@@ -1208,6 +1208,15 @@ async function handleListaEspera(clinicaId, paciente, telefone, dados, config) {
     if (m) medicoId = m.id;
   }
 
+  // Preferências de período/dia — a engine da fila viva (recepfy-web src/lib/fila.ts)
+  // FILTRA por periodo e dia_semana ao ofertar vaga; sem estes campos, o paciente que
+  // pediu "só de manhã" receberia oferta de tarde (promessa quebrada do play de horário).
+  const semAcento = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  const periodo = ['manha', 'tarde'].includes(semAcento(dados.periodo)) ? semAcento(dados.periodo) : 'qualquer';
+  const DIAS = { domingo: 0, segunda: 1, terca: 2, quarta: 3, quinta: 4, sexta: 5, sabado: 6 };
+  const diaKey = semAcento(dados.dia_semana).replace(/-feira$/, '');
+  const diaSemana = Object.prototype.hasOwnProperty.call(DIAS, diaKey) ? DIAS[diaKey] : null;
+
   // PERSISTE na fila de espera — é o que o painel/engine usa para ofertar a vaga
   // (link /fila/[token]) quando um horário cancela. Sem isso, a fila não existe de fato.
   const { error: leErr } = await supabase.from('lista_espera').insert({
@@ -1217,6 +1226,8 @@ async function handleListaEspera(clinicaId, paciente, telefone, dados, config) {
     telefone:    (telefone || '').replace(/\D/g, ''),
     medico_id:   medicoId,
     observacao:  dados.motivo || null,
+    periodo,
+    dia_semana:  diaSemana,
   });
   if (leErr) console.error('Erro ao inserir lista_espera:', leErr.message);
 
@@ -1583,15 +1594,23 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     //      na aba Comercial do painel.
     if (parsed.demandaReprimida) {
       const d = parsed.demandaReprimida;
-      const tipo = ['convenio', 'especialidade', 'horario', 'exame', 'outro'].includes(d.tipo) ? d.tipo : 'outro';
-      const { error: dErr } = await supabase.from('demanda_reprimida').insert({
+      const tipo = ['convenio', 'especialidade', 'horario', 'exame', 'preco', 'adiamento', 'outro'].includes(d.tipo) ? d.tipo : 'outro';
+      const row = {
         clinica_id: clinicaId,
         tipo,
         detalhe: d.detalhe || null,
         paciente_telefone: telefone,
         conversa_id: conversa.id,
         valor_estimado: Number(d.valor) || 0,
-      });
+      };
+      let { error: dErr } = await supabase.from('demanda_reprimida').insert(row);
+      // 'preco'/'adiamento' dependem da migration 20260723; se o check antigo recusar,
+      // rebaixa para 'outro' com o tipo no detalhe — perder o registro seria pior.
+      if (dErr && (dErr.code === '23514' || /tipo_check/.test(dErr.message || ''))) {
+        ({ error: dErr } = await supabase.from('demanda_reprimida').insert({
+          ...row, tipo: 'outro', detalhe: `[${tipo}] ${row.detalhe || ''}`.trim(),
+        }));
+      }
       if (dErr) console.error('Erro ao registrar demanda reprimida:', dErr.message);
     }
 
