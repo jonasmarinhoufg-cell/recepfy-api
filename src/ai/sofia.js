@@ -784,7 +784,13 @@ function _aplicarMensagem(estado, conteudo, prevTexto, isProf, config) {
     const prevTemHora    = /horário|quando|data|hora|agendar para/i.test(prevTexto);
     const prevTemLista   = /\d{1,2}:\d{2}|\d{2}\/\d{2}|segunda|ter[çc]a|quarta|quinta|sexta/i.test(prevTexto);
     const conteudoTemDT  = /\d{1,2}[\/h:]\d{2}|\d{1,2}\s*(h|hs|hrs)\b|segunda|ter[çc]a|quarta|quinta|sexta/i.test(conteudo);
-    if ((prevTemHora || prevTemLista || conteudoTemDT) && /\d/.test(conteudo)) {
+    // Objeção com dígito ("R$ 150 é caro demais", "nenhum desses 3 serve") NUNCA é horário
+    // escolhido — sem esta guarda o estado marcaria horário ✓ e a PRÓXIMA AÇÃO pularia
+    // direto para CONFIRME, atropelando a quebra de objeção.
+    // \b em "caro/cara": sem word boundary, "a Carolina vai junto às 15h" e "encaro
+    // qualquer horário" eram bloqueados como objeção (Carolina é nome comuníssimo).
+    const pareceObjecao  = /\bcar[oa]\b|car[ií]ssim|desconto|muito (alto|salgado)|vou pensar|nenhum desses|esse dia n[ãa]o/i.test(conteudo);
+    if (!pareceObjecao && (prevTemHora || prevTemLista || conteudoTemDT) && /\d/.test(conteudo)) {
       estado.horario = conteudo;
     }
   }
@@ -1468,7 +1474,35 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     const conversa = await getOrCreateConversa(clinicaId, paciente.id);
 
     // 4. Histórico desta conversa (últimas 20 mensagens)
-    const historico = await getHistorico(conversa.id);
+    let historico = await getHistorico(conversa.id);
+
+    // 4-ponte. Conversa RECÉM-criada com troca recente na anterior = continuação, não
+    // assunto novo: o cancelamento ENCERRA a conversa e a oferta "já vejo outro dia pra
+    // você?" fica na thread antiga — sem esta ponte, o "ok" do paciente chega ao modelo
+    // amnésico (histórico = só o "ok") e a remarcação morre num "como posso ajudar?".
+    // Limites estritos: só se o histórico atual está vazio, só mensagens de OUTRA
+    // conversa dos últimos 30 min, no máximo 4 — contexto emprestado, nunca salvo aqui.
+    if (historico.length === 0) {
+      try {
+        const { data: convAnt } = await supabase.from('conversas').select('id')
+          .eq('clinica_id', clinicaId).eq('paciente_id', paciente.id)
+          .neq('id', conversa.id)
+          .order('iniciada_em', { ascending: false }).limit(1).maybeSingle();
+        if (convAnt?.id) {
+          const { data: ponte } = await supabase.from('mensagens')
+            .select('role, conteudo')
+            .eq('conversa_id', convAnt.id)
+            .gte('created_at', new Date(Date.now() - 30 * 60 * 1000).toISOString())
+            .order('created_at', { ascending: false }).limit(4);
+          if (ponte?.length) {
+            historico = ponte.reverse().map(m => ({
+              role: m.role === 'user' ? 'user' : 'assistant',
+              content: m.conteudo,
+            }));
+          }
+        }
+      } catch (e) { console.error('[ponte-conversa]', e.message); }
+    }
 
     // 4a. Extrai estado atual da conversa em código (evita loop de perguntas)
     // mensagem é passada para incluir a resposta atual no estado (ela ainda não está no histórico)
@@ -1682,23 +1716,57 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     if (parsed.demandaReprimida) {
       const d = parsed.demandaReprimida;
       const tipo = ['convenio', 'especialidade', 'horario', 'exame', 'preco', 'adiamento', 'outro'].includes(d.tipo) ? d.tipo : 'outro';
-      const row = {
-        clinica_id: clinicaId,
-        tipo,
-        detalhe: d.detalhe || null,
-        paciente_telefone: telefone,
-        conversa_id: conversa.id,
-        valor_estimado: Number(d.valor) || 0,
-      };
-      let { error: dErr } = await supabase.from('demanda_reprimida').insert(row);
-      // 'preco'/'adiamento' dependem da migration 20260723; se o check antigo recusar,
-      // rebaixa para 'outro' com o tipo no detalhe — perder o registro seria pior.
-      if (dErr && (dErr.code === '23514' || /tipo_check/.test(dErr.message || ''))) {
-        ({ error: dErr } = await supabase.from('demanda_reprimida').insert({
-          ...row, tipo: 'outro', detalhe: `[${tipo}] ${row.detalhe || ''}`.trim(),
-        }));
+      // Dedup no SERVIDOR (mesmo padrão do DUVIDA_SEM_RESPOSTA abaixo): o marcador é
+      // stripado antes de salvar, então o modelo re-emite a mesma demanda a cada turno
+      // de objeção — 1 conversa gerava 3 linhas idênticas e inflava o Comercial 3×.
+      // Regra "no máximo uma por conversa" é aplicada AQUI, não confiada ao prompt.
+      const { data: dExistente } = await supabase.from('demanda_reprimida')
+        .select('id, tipo, detalhe, valor_estimado')
+        .eq('conversa_id', conversa.id)
+        .limit(1)
+        .maybeSingle();
+      if (!dExistente) {
+        const row = {
+          clinica_id: clinicaId,
+          tipo,
+          detalhe: d.detalhe || null,
+          paciente_telefone: telefone,
+          conversa_id: conversa.id,
+          valor_estimado: Number(d.valor) || 0,
+        };
+        let { error: dErr } = await supabase.from('demanda_reprimida').insert(row);
+        // 'preco'/'adiamento' dependem da migration 20260723; se o check antigo recusar,
+        // rebaixa para 'outro' com o tipo no detalhe — perder o registro seria pior.
+        if (dErr && (dErr.code === '23514' || /tipo_check/.test(dErr.message || ''))) {
+          ({ error: dErr } = await supabase.from('demanda_reprimida').insert({
+            ...row, tipo: 'outro', detalhe: `[${tipo}] ${row.detalhe || ''}`.trim(),
+          }));
+        }
+        if (dErr) console.error('Erro ao registrar demanda reprimida:', dErr.message);
+      } else if (tipo === 'preco' &&
+        (dExistente.tipo === 'adiamento' ||
+         (dExistente.tipo === 'outro' && /^\[adiamento\]/.test(dExistente.detalhe || '')))) {
+        // Objeção que COMEÇOU como "vou pensar" e se revelou preço: preço é mais
+        // específico e prevalece — promove o registro em vez de duplicar. Cobre também
+        // a forma do fallback pré-migration-20260723 ('outro' + "[adiamento]" no detalhe):
+        // nesse caso o check antigo recusaria tipo='preco', então promove DENTRO da
+        // forma fallback ('outro' + "[preco]"). E carrega o valor: demanda de adiamento
+        // nasce com 0, e o valor da tabela chega junto com a objeção de preço.
+        const promoFallback = dExistente.tipo === 'outro';
+        const patch = promoFallback
+          ? { detalhe: `[preco] ${d.detalhe || ''}`.trim() }
+          : { tipo: 'preco', detalhe: d.detalhe || undefined };
+        if (Number(d.valor) > 0 && !(Number(dExistente.valor_estimado) > 0)) patch.valor_estimado = Number(d.valor);
+        let { error: upErr } = await supabase.from('demanda_reprimida').update(patch).eq('id', dExistente.id);
+        if (upErr && (upErr.code === '23514' || /tipo_check/.test(upErr.message || ''))) {
+          ({ error: upErr } = await supabase.from('demanda_reprimida')
+            .update({ ...patch, tipo: 'outro', detalhe: `[preco] ${d.detalhe || ''}`.trim() })
+            .eq('id', dExistente.id));
+        }
+        if (upErr) console.error('Erro ao promover demanda reprimida para preco:', upErr.message);
       }
-      if (dErr) console.error('Erro ao registrar demanda reprimida:', dErr.message);
+      // Qualquer outro caso (mesmo tipo, ou tipo diferente sem regra de promoção): skip
+      // silencioso — a primeira demanda da conversa é a que vale.
     }
 
     // 12c. Dúvida sem resposta — a Sofia não soube responder algo legítimo. Diferente do

@@ -28,7 +28,13 @@ app.get('/', (req, res) => {
 // Probe de saúde — usado pelo teste da aba Integrações do admin (recepfy-web)
 // e por monitores externos. Responde rápido e sem tocar em dependências.
 app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime_s: Math.round(process.uptime()) });
+  // commit: hash injetado pela Railway em runtime — protocolo de teste "confirmar o
+  // deploy ANTES de testar" (sem isso, testava-se código velho achando que era o novo).
+  res.json({
+    ok: true,
+    uptime_s: Math.round(process.uptime()),
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+  });
 });
 
 app.post('/cache/invalidate', (req, res) => {

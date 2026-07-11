@@ -105,6 +105,31 @@ function agendarProcessamento(instanceName, clinicaId, telefone, texto) {
 // Sonnet cheia cada). DENTRO de conversa ativa ("ok" confirmando um horário!) segue pro modelo.
 const TRIVIAL = /^(ok(ay)?|blz|beleza|obrigad[oa]s?|muito obrigad[oa]|valeu|certo|perfeito|combinado|confirmado|ta bom|tá bom|de nada|show|top|joia|jóia|tudo bem|👍|🙏|❤️|😊|👌)[\s.!,]*$/i;
 
+// Confirmação textual do lembrete D-1 (determinística, sem LLM): "ok/sim/confirmado"
+// com consulta 'aguardando' à frente é o paciente confirmando presença. Sem isto, a
+// resposta natural cairia no atalho TRIVIAL ("Combinado!") sem gravar nada e o único
+// caminho de volta a 'confirmado' seria o link /c/<token>.
+const CONFIRMA = /^(sim|ok(ay)?|confirmo|confirmad[oa]|pode confirmar|confirmar|vou sim|estarei l[áa]|blz|beleza|certo|combinado|👍)[\s.!,]*$/i;
+
+// A última fala da Sofia era pergunta ou oferta em aberto (remarcação pós-cancelamento,
+// encaixe, "vejo outro dia")? Então um "ok" NÃO é despedida — é o paciente ACEITANDO.
+const OFERTA_ABERTA = /vejo outro dia|remarcar|reagendar|te encaixo|posso anotar/i;
+async function ultimaFalaEmAberto(clinicaId, pacienteId) {
+  // Última conversa do paciente (QUALQUER status — o cancelamento encerra a conversa,
+  // e é exatamente essa oferta pós-encerramento que não pode morrer num "ok").
+  const { data: conv } = await supabase.from('conversas').select('id')
+    .eq('clinica_id', clinicaId).eq('paciente_id', pacienteId)
+    .order('iniciada_em', { ascending: false }).limit(1).maybeSingle();
+  if (!conv?.id) return false;
+  const { data: ultima } = await supabase.from('mensagens').select('conteudo')
+    .eq('conversa_id', conv.id).eq('role', 'assistant')
+    .gte('created_at', new Date(Date.now() - 15 * 60 * 1000).toISOString())
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (!ultima?.conteudo) return false;
+  const texto = String(ultima.conteudo).trim();
+  return /\?$/.test(texto) || OFERTA_ABERTA.test(texto);
+}
+
 async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
   // Trava do atendimento humano (conversas.humano_ate): um humano assumiu a conversa
   // pelo painel → a mensagem do paciente é salva na conversa (o helper faz isso), mas
@@ -112,50 +137,72 @@ async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
   // ANTES do atalho TRIVIAL: nem o "obrigado" de resposta fixa pode atropelar o humano.
   if (await emAtendimentoHumano(clinicaId, telefone, mensagem)) return;
 
-  // Confirmação textual do lembrete D-1 (determinística, sem LLM): "ok/sim/confirmado"
-  // com consulta 'aguardando' à frente é o paciente confirmando presença. Sem isto, a
-  // resposta natural cairia no atalho TRIVIAL ("Combinado!") sem gravar nada e o único
-  // caminho de volta a 'confirmado' seria o link /c/<token>.
-  const CONFIRMA = /^(sim|ok(ay)?|confirmo|confirmad[oa]|pode confirmar|confirmar|vou sim|estarei l[áa]|blz|beleza|certo|combinado|👍)[\s.!,]*$/i;
-  if (CONFIRMA.test(mensagem.trim())) {
+  // Resolve paciente + conversa ativa UMA vez — CONFIRMA e TRIVIAL decidem pelo MESMO
+  // dado (antes cada bloco repetia a query e o CONFIRMA nem olhava a conversa: um "sim"
+  // a qualquer pergunta da Sofia, vindo de paciente com consulta 'aguardando', virava
+  // "Presença confirmada!" no meio da venda). Erro na consulta → na dúvida, modelo.
+  const msgTrim = mensagem.trim();
+  const isConfirma = CONFIRMA.test(msgTrim);
+  const isTrivial = TRIVIAL.test(msgTrim);
+  let pacienteId = null;
+  let temConversaAtiva = false;
+  let contextoResolvido = false;
+  if (isConfirma || isTrivial) {
     try {
       const { data: pac } = await supabase.from('pacientes').select('id')
         .eq('clinica_id', clinicaId).eq('telefone', telefone).maybeSingle();
-      if (pac?.id) {
-        const { data: ag } = await supabase.from('agendamentos')
-          .select('id, data_hora')
-          .eq('clinica_id', clinicaId).eq('paciente_id', pac.id)
-          .eq('status', 'aguardando')
-          .gte('data_hora', new Date().toISOString())
-          .order('data_hora', { ascending: true }).limit(1).maybeSingle();
-        if (ag?.id) {
-          const { error: cErr } = await supabase.from('agendamentos')
-            .update({ status: 'confirmado', confirmado_em: new Date().toISOString(), confirmado_pelo_paciente: true })
-            .eq('id', ag.id);
-          if (!cErr) {
-            const quando = new Date(ag.data_hora).toLocaleString('pt-BR', {
-              timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-            });
-            await sendMessage(instanceName, telefone, `Presença confirmada! ✅ Te esperamos ${quando}.`);
-            return;
-          }
+      pacienteId = pac?.id || null;
+      if (pacienteId) {
+        // Janela de 2h — a MESMA da getOrCreateConversa: conversa 'ativa' abandonada
+        // há dias (o status não fecha sozinho sem o pg_cron da migration 20260724)
+        // não pode segurar o CONFIRMA de um paciente respondendo "sim" ao lembrete.
+        const duasHorasAtras = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+        const { data: conv } = await supabase.from('conversas').select('id')
+          .eq('clinica_id', clinicaId).eq('paciente_id', pacienteId).eq('status', 'ativa')
+          .gte('iniciada_em', duasHorasAtras)
+          .limit(1).maybeSingle();
+        temConversaAtiva = !!conv;
+      }
+      contextoResolvido = true;
+    } catch (e) { console.error('[atalhos] contexto não resolvido, segue pro modelo:', e.message); }
+  }
+
+  // CONFIRMA só dispara FORA de conversa ativa: dentro de uma conversa em curso, "sim"
+  // é resposta ao que a Sofia perguntou (horário, convênio...) — segue pro modelo.
+  if (isConfirma && contextoResolvido && !temConversaAtiva && pacienteId) {
+    try {
+      const { data: ag } = await supabase.from('agendamentos')
+        .select('id, data_hora')
+        .eq('clinica_id', clinicaId).eq('paciente_id', pacienteId)
+        .eq('status', 'aguardando')
+        .gte('data_hora', new Date().toISOString())
+        .order('data_hora', { ascending: true }).limit(1).maybeSingle();
+      if (ag?.id) {
+        const { error: cErr } = await supabase.from('agendamentos')
+          .update({ status: 'confirmado', confirmado_em: new Date().toISOString(), confirmado_pelo_paciente: true })
+          .eq('id', ag.id);
+        if (!cErr) {
+          const quando = new Date(ag.data_hora).toLocaleString('pt-BR', {
+            timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+          });
+          await sendMessage(instanceName, telefone, `Presença confirmada! ✅ Te esperamos ${quando}.`);
+          return;
         }
       }
     } catch (e) { console.error('[confirma-texto]', e.message); }
   }
-  if (TRIVIAL.test(mensagem.trim())) {
-    let temConversaAtiva = false;
-    try {
-      const { data: pac } = await supabase.from('pacientes').select('id')
-        .eq('clinica_id', clinicaId).eq('telefone', telefone).maybeSingle();
-      if (pac?.id) {
-        const { data: conv } = await supabase.from('conversas').select('id')
-          .eq('clinica_id', clinicaId).eq('paciente_id', pac.id).eq('status', 'ativa')
-          .limit(1).maybeSingle();
-        temConversaAtiva = !!conv;
-      }
-    } catch { /* na dúvida, segue pro modelo */ temConversaAtiva = true; }
-    if (!temConversaAtiva) {
+
+  if (isTrivial && contextoResolvido && !temConversaAtiva) {
+    // A resposta fixa não pode matar a remarcação pós-cancelamento: "Cancelado! Se quiser,
+    // já vejo outro dia pra você" encerra a conversa, e o "ok" do paciente é um SIM à
+    // oferta — se a última fala da Sofia (15 min) termina em "?" ou contém oferta, o
+    // "ok" segue pro modelo em vez do "Combinado!" que enterraria a venda.
+    let emAberto = false;
+    if (pacienteId) {
+      try { emAberto = await ultimaFalaEmAberto(clinicaId, pacienteId); }
+      catch (e) { console.error('[trivial] checagem de oferta falhou, segue pro modelo:', e.message); emAberto = true; }
+    }
+    if (!emAberto) {
       const resposta = /obrigad|valeu|🙏/i.test(mensagem)
         ? 'De nada! 😊 Precisando, é só chamar.'
         : 'Combinado! 😊 Qualquer coisa, é só chamar.';
