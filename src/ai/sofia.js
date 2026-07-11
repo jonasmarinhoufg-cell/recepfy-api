@@ -8,7 +8,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { buildPrompt, buildPromptFixo, buildPromptVolatil } = require('./prompt');
 const { parseResponse } = require('./parser');
 const { createClient } = require('@supabase/supabase-js');
-const { sendMessage } = require('../whatsapp/sender');
+const { sendMessage, toWhatsAppNumberBR } = require('../whatsapp/sender');
 
 function normalizePhone(raw) {
   let d = (raw || '').replace(/\D/g, '');
@@ -349,6 +349,52 @@ async function salvarMensagem(conversaId, role, conteudo, tokens = 0) {
     conversa_id: conversaId, role, conteudo, tokens_usados: tokens,
   });
   if (error) console.error('Erro ao salvar mensagem:', error.message);
+}
+
+// ─── TRAVA DO ATENDIMENTO HUMANO (conversas.humano_ate) ─────────────────────
+// Resposta humana pelo painel numa conversa ATIVA grava humano_ate = now()+60min
+// (renovada a cada resposta — escrita fica no recepfy-web). Enquanto humano_ate
+// estiver no futuro, a Sofia fica MUDA: salva a mensagem do paciente na conversa
+// (o atendente vê no painel em tempo real) e não gera resposta nem "digitando" —
+// sem isso, IA e humano falariam por cima um do outro na mesma janela.
+// Difere da trava permanente por resolucao='handoff' (conversa ENCERRADA, hold de
+// 24h com resposta fixa, em processarMensagem 2a): aqui a conversa segue ATIVA e
+// a trava expira sozinha. SEM o filtro de 2h da getOrCreateConversa: atendimento
+// humano longo não pode "reabrir" a Sofia só porque a conversa envelheceu.
+// Resiliente a migration pendente: select('*') não erra com coluna ausente —
+// humano_ate vem undefined e a trava simplesmente não existe.
+// Falha ABERTA: erro na checagem → Sofia responde normal (silenciar por erro
+// deixaria o paciente no vácuo sem ninguém saber).
+// Variante somente-leitura: acha a conversa ativa com trava vigente (ou null).
+// Olha até 5 conversas ativas — o paciente pode ter mais de uma "ativa" (a janela
+// de 2h da getOrCreateConversa abandona a antiga sem encerrar) e a trava pode
+// estar na que o painel respondeu, não na mais recente.
+async function conversaComTravaHumana(clinicaId, telefone) {
+  try {
+    const { data: pac } = await supabase.from('pacientes').select('id')
+      .eq('clinica_id', clinicaId).eq('telefone', telefone).maybeSingle();
+    if (!pac?.id) return null; // paciente novo não tem conversa ativa, logo não tem trava
+
+    const { data: convs } = await supabase.from('conversas').select('*')
+      .eq('clinica_id', clinicaId).eq('paciente_id', pac.id).eq('status', 'ativa')
+      .order('iniciada_em', { ascending: false }).limit(5);
+    return (convs || []).find(c => c.humano_ate && new Date(c.humano_ate) > new Date()) || null;
+  } catch (e) {
+    console.error('[trava-humano]', e.message);
+    return null;
+  }
+}
+
+async function emAtendimentoHumano(clinicaId, telefone, mensagem) {
+  try {
+    const conv = await conversaComTravaHumana(clinicaId, telefone);
+    if (!conv) return false;
+    await salvarMensagem(conv.id, 'user', mensagem);
+    return true;
+  } catch (e) {
+    console.error('[trava-humano]', e.message);
+    return false;
+  }
 }
 
 async function cancelarAgendamento(clinicaId, pacienteId) {
@@ -1361,25 +1407,41 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       .maybeSingle();
 
     if (handoffAtivo) {
-      const conversa = await getOrCreateConversa(clinicaId, paciente.id);
-      await salvarMensagem(conversa.id, 'user', mensagem);
+      // A réplica do paciente vai para a PRÓPRIA conversa do handoff (encerrada), não
+      // para uma conversa nova: o painel está com essa thread aberta (tempo real) e o
+      // atendente precisa ver a resposta ali — numa conversa nova ela sumiria da tela.
+      await salvarMensagem(handoffAtivo.id, 'user', mensagem);
       // Override de segurança: mesmo em handoff (hold de 24h), um sinal claro de
       // emergência não pode ficar sem orientação nem sem avisar a clínica.
       const EMERGENCIA = /(dor no peito|aperto no peito|n[ãa]o consigo respirar|falta de ar|desmai|sangramento intenso|sangrando muito|\bavc\b|derrame|convuls)/i;
       if (EMERGENCIA.test(mensagem || '')) {
         const emergMsg = 'Pelo que você descreveu, procure atendimento de emergência AGORA: ligue 192 (SAMU) ou vá à UPA/pronto-socorro mais próximo. Já avisei a equipe da clínica.';
-        await salvarMensagem(conversa.id, 'assistant', emergMsg);
+        await salvarMensagem(handoffAtivo.id, 'assistant', emergMsg);
         try {
-          await supabase.from('notificacoes').insert({
-            clinica_id: clinicaId, paciente_id: paciente.id, tipo: 'urgencia',
-            titulo: '🚨 Possível urgência (paciente em atendimento humano)',
-            corpo: `${paciente.nome || telefone} (${telefone}) durante handoff: "${mensagem}"`,
-          });
+          // Com medico_id: o painel do médico filtra o sino por medico_id (RLS idem) —
+          // sem ele, a urgência ficaria invisível justamente para quem precisa agir.
+          const cfgU = await getClinicConfig(clinicaId).catch(() => null);
+          const medsU = (cfgU?.medicos || []).filter(m => m.id);
+          if (medsU.length) {
+            for (const m of medsU) {
+              await supabase.from('notificacoes').insert({
+                clinica_id: clinicaId, medico_id: m.id, paciente_id: paciente.id, tipo: 'urgencia',
+                titulo: '🚨 Possível urgência (paciente em atendimento humano)',
+                corpo: `${paciente.nome || telefone} (${telefone}) durante handoff: "${mensagem}"`,
+              });
+            }
+          } else {
+            await supabase.from('notificacoes').insert({
+              clinica_id: clinicaId, paciente_id: paciente.id, tipo: 'urgencia',
+              titulo: '🚨 Possível urgência (paciente em atendimento humano)',
+              corpo: `${paciente.nome || telefone} (${telefone}) durante handoff: "${mensagem}"`,
+            });
+          }
         } catch (e) { console.error('[urgencia-handoff]', e.message); }
         return emergMsg;
       }
       const holdMsg = 'Nossa equipe vai te atender em breve. 🙏';
-      await salvarMensagem(conversa.id, 'assistant', holdMsg);
+      await salvarMensagem(handoffAtivo.id, 'assistant', holdMsg);
       return holdMsg;
     }
 
@@ -1539,6 +1601,31 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
         titulo: 'Paciente precisa de atendimento humano',
         corpo: `${nomePaciente} (${telefone}) — "${mensagem}"${contexto}`,
       });
+
+      // Aviso IMEDIATO no WhatsApp da dona: a notificação acima só é vista com o
+      // painel aberto, e handoff é urgente por definição (paciente esperando gente).
+      // Best-effort: o handoff NUNCA pode falhar por causa do aviso (try/catch total).
+      try {
+        const telClinica = normalizePhone(config.clinica?.telefone);
+        if (telClinica) {
+          const { data: whaHandoff } = await supabase
+            .from('whatsapp_instancias').select('instance_name, numero')
+            .eq('clinica_id', clinicaId).maybeSingle();
+          // Guarda anti auto-mensagem: se o telefone da clínica É o número da própria
+          // instância da Sofia, o aviso iria "de mim para mim" (ninguém notificado) —
+          // pula em silêncio. Compara na MESMA forma canônica do envio (9º dígito etc.);
+          // numero pode vir não-numérico (profileName) → não casa → envia normal.
+          const mesmoNumero = whaHandoff?.numero &&
+            toWhatsAppNumberBR(whaHandoff.numero) === toWhatsAppNumberBR(telClinica);
+          // Fail CLOSED sem numero registrado: se a instância nunca gravou o próprio
+          // número, não dá para garantir que clinica.telefone não é a própria Sofia —
+          // auto-mensagem confunde mais do que ajuda; o painel/e-mail já cobrem o aviso.
+          if (whaHandoff?.instance_name && whaHandoff?.numero && !mesmoNumero) {
+            await sendMessage(whaHandoff.instance_name, telClinica,
+              `🔔 Paciente aguardando atendimento humano: ${nomePaciente} (${telefone}) — "${String(mensagem).slice(0, 200)}"`);
+          }
+        }
+      } catch (e) { console.error('[handoff] aviso WhatsApp à clínica falhou:', e.message); }
     }
 
     // 11b. Urgência — triagem detectou sinal de risco: encerra e notifica médico(s) com prioridade máxima
@@ -1653,4 +1740,4 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
   }
 }
 
-module.exports = { processarMensagem, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse };
+module.exports = { processarMensagem, emAtendimentoHumano, conversaComTravaHumana, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse };

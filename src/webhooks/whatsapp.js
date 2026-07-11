@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { processarMensagem } = require('../ai/sofia');
+const { processarMensagem, emAtendimentoHumano, conversaComTravaHumana } = require('../ai/sofia');
 const { transcribeAudioMessage } = require('../ai/transcriber');
 const { sendMessage, sendTyping } = require('../whatsapp/sender');
 const { createClient } = require('@supabase/supabase-js');
@@ -106,6 +106,43 @@ function agendarProcessamento(instanceName, clinicaId, telefone, texto) {
 const TRIVIAL = /^(ok(ay)?|blz|beleza|obrigad[oa]s?|muito obrigad[oa]|valeu|certo|perfeito|combinado|confirmado|ta bom|tá bom|de nada|show|top|joia|jóia|tudo bem|👍|🙏|❤️|😊|👌)[\s.!,]*$/i;
 
 async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
+  // Trava do atendimento humano (conversas.humano_ate): um humano assumiu a conversa
+  // pelo painel → a mensagem do paciente é salva na conversa (o helper faz isso), mas
+  // a Sofia não responde nem mostra "digitando" — silêncio total até a trava expirar.
+  // ANTES do atalho TRIVIAL: nem o "obrigado" de resposta fixa pode atropelar o humano.
+  if (await emAtendimentoHumano(clinicaId, telefone, mensagem)) return;
+
+  // Confirmação textual do lembrete D-1 (determinística, sem LLM): "ok/sim/confirmado"
+  // com consulta 'aguardando' à frente é o paciente confirmando presença. Sem isto, a
+  // resposta natural cairia no atalho TRIVIAL ("Combinado!") sem gravar nada e o único
+  // caminho de volta a 'confirmado' seria o link /c/<token>.
+  const CONFIRMA = /^(sim|ok(ay)?|confirmo|confirmad[oa]|pode confirmar|confirmar|vou sim|estarei l[áa]|blz|beleza|certo|combinado|👍)[\s.!,]*$/i;
+  if (CONFIRMA.test(mensagem.trim())) {
+    try {
+      const { data: pac } = await supabase.from('pacientes').select('id')
+        .eq('clinica_id', clinicaId).eq('telefone', telefone).maybeSingle();
+      if (pac?.id) {
+        const { data: ag } = await supabase.from('agendamentos')
+          .select('id, data_hora')
+          .eq('clinica_id', clinicaId).eq('paciente_id', pac.id)
+          .eq('status', 'aguardando')
+          .gte('data_hora', new Date().toISOString())
+          .order('data_hora', { ascending: true }).limit(1).maybeSingle();
+        if (ag?.id) {
+          const { error: cErr } = await supabase.from('agendamentos')
+            .update({ status: 'confirmado', confirmado_em: new Date().toISOString(), confirmado_pelo_paciente: true })
+            .eq('id', ag.id);
+          if (!cErr) {
+            const quando = new Date(ag.data_hora).toLocaleString('pt-BR', {
+              timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+            });
+            await sendMessage(instanceName, telefone, `Presença confirmada! ✅ Te esperamos ${quando}.`);
+            return;
+          }
+        }
+      }
+    } catch (e) { console.error('[confirma-texto]', e.message); }
+  }
   if (TRIVIAL.test(mensagem.trim())) {
     let temConversaAtiva = false;
     try {
@@ -250,6 +287,9 @@ router.post('/whatsapp', async (req, res) => {
       const cap = checarCap(telefone);
       if (cap === 'silencio') return;
       if (cap === 'avisar') {
+        // Trava do atendimento humano vale também para respostas fixas — a Sofia não
+        // fala por cima do atendente nem para pedir calma.
+        if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
         await sendMessage(instanceName, telefone, 'Recebemos muitas mensagens seguidas. Aguarde um momento antes de continuar, por favor. 🙏');
         return;
       }
@@ -259,6 +299,7 @@ router.post('/whatsapp', async (req, res) => {
         agendarProcessamento(instanceName, instancia.clinica_id, telefone, transcricao);
       } catch (e) {
         console.error('Erro ao transcrever áudio:', e);
+        if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
         await new Promise(r => setTimeout(r, 1200));
         await sendMessage(instanceName, telefone,
           'Não consegui ouvir seu áudio. Pode digitar o que precisa? 🙏'
@@ -277,6 +318,7 @@ router.post('/whatsapp', async (req, res) => {
       );
       res.sendStatus(200);
       if (temMidia) {
+        if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
         await new Promise(r => setTimeout(r, 1200));
         await sendMessage(instanceName, telefone,
           'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?'
@@ -305,6 +347,7 @@ router.post('/whatsapp', async (req, res) => {
     const cap = checarCap(telefone);
     if (cap === 'silencio') return;
     if (cap === 'avisar') {
+      if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
       await sendMessage(instanceName, telefone, 'Recebemos muitas mensagens seguidas. Aguarde um momento antes de continuar, por favor. 🙏');
       return;
     }

@@ -64,4 +64,7 @@ async function sendTyping(instanceName, phone) {
   }
 }
 
-module.exports = { sendMessage, sendTyping };
+// toWhatsAppNumberBR exportado para COMPARAÇÃO de números (ex.: telefone da clínica
+// vs. número da instância) na mesma forma canônica usada no envio — comparar formas
+// diferentes (12 vs 13 dígitos) geraria falso "números distintos".
+module.exports = { sendMessage, sendTyping, toWhatsAppNumberBR };
