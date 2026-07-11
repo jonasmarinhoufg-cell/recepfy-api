@@ -73,7 +73,12 @@ async function getClinicConfig(clinicaId) {
       supabase.from('clinicas').select('*').eq('id', clinicaId).single(),
       supabase.from('sofia_configs').select('*').eq('clinica_id', clinicaId).maybeSingle(),
       supabase.from('medicos').select('*').eq('clinica_id', clinicaId).eq('ativo', true),
-      supabase.from('faqs').select('*').eq('clinica_id', clinicaId).order('ordem'),
+      // FAQ desativada no painel NÃO pode vazar para o prompt. O filtro é
+      // or(is.null,eq.true) — e não .eq('ativo', true) — porque a coluna tem
+      // default true (verificado no banco) mas a tabela antecede as migrations
+      // versionadas e o NOT NULL não é comprovável: FAQ legada com ativo NULL
+      // precisa continuar valendo (hoje não há NULLs; isto é cinto de segurança).
+      supabase.from('faqs').select('*').eq('clinica_id', clinicaId).or('ativo.is.null,ativo.eq.true').order('ordem'),
       supabase.from('convenios').select('nome, planos, aceito, exige_autorizacao, observacao').eq('clinica_id', clinicaId),
       supabase.from('precos_particular').select('procedimento, valor, observacao').eq('clinica_id', clinicaId),
     ]);
@@ -1774,13 +1779,21 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     //      ou completar o cadastro (FAQ/Comercial). Sem isso, o paciente sai sem resposta
     //      e a clínica nunca fica sabendo.
     if (parsed.duvidaSemResposta) {
+      // Nome configurado da assistente no título (config já está em escopo — mesmo
+      // padrão da notificação de urgência acima); fallback 'Sofia'.
+      const nomeIA = config.sofia?.nome_assistente || 'Sofia';
       // Dedup: o marcador é stripado antes de salvar, então o modelo não "lembra" que já
       // o emitiu — sem esta trava, a mesma dúvida reformulada geraria 1 notificação por turno.
+      // ATENÇÃO: título e dedup mudam JUNTOS — como o título agora carrega o nome
+      // dinâmico, o match é por tipo 'handoff' + sufixo "não soube responder" (like),
+      // não por título exato; assim o dedup sobrevive a renomear a assistente e às
+      // notificações antigas "Sofia não soube responder" já gravadas.
       const { data: jaNotificado } = await supabase.from('notificacoes')
         .select('id')
         .eq('clinica_id', clinicaId)
         .eq('paciente_id', paciente.id)
-        .eq('titulo', 'Sofia não soube responder')
+        .eq('tipo', 'handoff')
+        .like('titulo', '%não soube responder%')
         .gte('created_at', new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString())
         .limit(1)
         .maybeSingle();
@@ -1790,7 +1803,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
           clinica_id:  clinicaId,
           paciente_id: paciente.id,
           tipo: 'handoff',
-          titulo: 'Sofia não soube responder',
+          titulo: `${nomeIA} não soube responder`,
           corpo: `${paciente.nome || telefone} (${telefone}) perguntou: "${pergunta}". Responda pelo painel ou complete o cadastro (FAQs, convênios, preços) para a próxima vez.`,
         });
         if (dsErr) console.error('Erro ao registrar dúvida sem resposta:', dsErr.message);
