@@ -1418,6 +1418,11 @@ async function enviarRecalls() {
 
 // ─── FUNÇÃO PRINCIPAL ─────────────────────────────────────────────────────────
 
+// [PERFIL]: conversas que já processaram o marcador neste processo — trava dura de
+// "no máximo 1 por conversa" que o prompt sozinho não garante (modelo tagarela
+// re-emite o marcador a cada turno). Best-effort: zera a cada restart.
+const perfilJaProcessado = new Set();
+
 async function processarMensagem(clinicaId, telefone, mensagem) {
   try {
     // 1. Configs da clínica (usa cache quando possível)
@@ -1889,7 +1894,8 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     //      porque a extração só acontecia quando o agendamento fechava. Aqui o nome/
     //      interesse dito em conversa vira cadastro na hora. Best-effort: NUNCA pode
     //      quebrar nem atrasar a resposta ao paciente (try/catch total).
-    if (parsed.perfil) {
+    // Trava dura: se esta conversa já processou um [PERFIL] neste processo, pula o bloco inteiro.
+    if (parsed.perfil && !perfilJaProcessado.has(conversa.id)) {
       try {
         const perf = parsed.perfil;
         // Nome: só grava se o cadastro ainda está vazio — atualizarNomePaciente já
@@ -1922,6 +1928,13 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
               console.error('[PERFIL] tag:', tagErr.message);
             }
           }
+        }
+        // Só arma a trava se o perfil tinha conteúdo acionável — payload vazio
+        // ([PERFIL:{}]) não queima o único slot da conversa.
+        if ((typeof perf.nome === 'string' && perf.nome.trim()) || interesse) {
+          // Cap grosseiro de memória — a trava é best-effort por processo.
+          if (perfilJaProcessado.size > 2000) perfilJaProcessado.clear();
+          perfilJaProcessado.add(conversa.id);
         }
       } catch (e) { console.error('[PERFIL]', e.message); }
     }
