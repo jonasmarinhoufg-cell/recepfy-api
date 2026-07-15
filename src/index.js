@@ -93,6 +93,15 @@ app.listen(PORT, () => {
   console.log(`Recepfy API rodando na porta ${PORT}`);
 });
 
+// O transcriber usa Whisper (OpenAI): sem a chave, TODO áudio de paciente cai no
+// fallback "não consegui ouvir". Warn alto no boot — nunca derruba o processo.
+if (!process.env.OPENAI_API_KEY) {
+  console.warn('='.repeat(72));
+  console.warn('[BOOT] OPENAI_API_KEY AUSENTE — transcrição de áudio (Whisper) DESLIGADA.');
+  console.warn('[BOOT] Todo áudio de paciente cairá no fallback "não consegui ouvir".');
+  console.warn('='.repeat(72));
+}
+
 // NPS, Lembrete D-1 e Follow-up são disparados pelos Vercel Crons do recepfy-web (FONTE ÚNICA —
 // os do web trazem o link /c/<token> que alimenta a confirmação de presença, a Fila viva e o
 // anti-falta). Desligados AQUI para não duplicar mensagem ao mesmo paciente (risco de ban do

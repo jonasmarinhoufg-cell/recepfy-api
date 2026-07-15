@@ -1950,4 +1950,4 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
   }
 }
 
-module.exports = { processarMensagem, emAtendimentoHumano, conversaComTravaHumana, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse };
+module.exports = { processarMensagem, emAtendimentoHumano, conversaComTravaHumana, invalidateCache, enviarNpsPendentes, enviarLembretes, enviarFollowups, enviarReengajamentos, enviarRecalls, verificarFairUse, getOrCreatePaciente, getOrCreateConversa, salvarMensagem };

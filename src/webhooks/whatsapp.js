@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { processarMensagem, emAtendimentoHumano, conversaComTravaHumana } = require('../ai/sofia');
+const { processarMensagem, emAtendimentoHumano, conversaComTravaHumana, getOrCreatePaciente, getOrCreateConversa, salvarMensagem } = require('../ai/sofia');
 const { transcribeAudioMessage } = require('../ai/transcriber');
 const { sendMessage, sendTyping } = require('../whatsapp/sender');
 const { createClient } = require('@supabase/supabase-js');
@@ -12,6 +12,29 @@ const supabase = createClient(
 
 // Deduplicação: evita reprocessar o mesmo evento enviado duas vezes pela Evolution API
 const processedMessageIds = new Set();
+
+// ── RASTRO DAS RESPOSTAS FIXAS ───────────────────────────────────────────────
+// Respostas que saem por sendMessage() sem passar pelo processarMensagem não
+// gravavam NADA em conversas/mensagens — a clínica ficava cega justamente nos
+// piores momentos. Best-effort TOTAL: roda DEPOIS do sendMessage, nunca lança.
+async function salvarFallback(clinicaId, telefone, { user, assistant, encerrar } = {}) {
+  try {
+    const paciente = await getOrCreatePaciente(clinicaId, telefone);
+    const conversa = await getOrCreateConversa(clinicaId, paciente.id);
+    if (user) await salvarMensagem(conversa.id, 'user', user);
+    if (assistant) await salvarMensagem(conversa.id, 'assistant', assistant);
+    // Troca TERMINAL (ex.: "Presença confirmada!", "Combinado!"): encerra a conversa
+    // — deixá-la 'ativa' faria o próximo "obrigado" do paciente pular o atalho
+    // (gate !temConversaAtiva) e pagar uma chamada de modelo à toa.
+    if (encerrar) {
+      await supabase.from('conversas')
+        .update({ status: 'encerrada', resolucao: 'ia', encerrada_em: new Date().toISOString() })
+        .eq('id', conversa.id).eq('status', 'ativa');
+    }
+  } catch (e) {
+    console.error('[salvarFallback]', e.message);
+  }
+}
 
 // ── GATE DE PAGAMENTO/TRIAL ──────────────────────────────────────────────────
 // Clínica sem billing ativo NÃO consome IA (trial expirado/inadimplente = margem -100%:
@@ -35,14 +58,27 @@ async function getBillingInfo(clinicaId) {
 
 const suspensoAvisado = new Map();    // telefone → ts (aviso ao paciente no máx. 1x/6h)
 const suspensoNotificado = new Map(); // clinicaId → ts (notificação ao dono no máx. 1x/24h)
-async function responderSuspenso(instanceName, telefone, clinicaId, info) {
+async function responderSuspenso(instanceName, telefone, clinicaId, info, mensagem) {
+  // O gate de billing retorna ANTES do cap anti-flood do caminho normal — sem este
+  // teto, um flood contra clínica suspensa gravaria linhas ilimitadas no banco.
+  if (checarCap(telefone) === 'silencio') return;
   const now = Date.now();
+  let avisoEnviado = null;
   if ((suspensoAvisado.get(telefone) || 0) < now - 6 * 3600 * 1000) {
     suspensoAvisado.set(telefone, now);
-    await sendMessage(instanceName, telefone,
+    avisoEnviado =
       `O atendimento automático da ${info.nome} está temporariamente indisponível. ` +
-      `Por favor, entre em contato direto com a clínica${info.telefone ? ` pelo telefone ${info.telefone}` : ''}. 🙏`);
+      `Por favor, entre em contato direto com a clínica${info.telefone ? ` pelo telefone ${info.telefone}` : ''}. 🙏`;
+    // Falha no envio não pode engolir o rastro nem a notificação ao dono abaixo.
+    try { await sendMessage(instanceName, telefone, avisoEnviado); }
+    catch (e) { console.error('[gate-billing] aviso não enviado:', e.message); avisoEnviado = null; }
   }
+  // Clínica inativa precisa ver quem chamou enquanto esteve pausada: a fala do
+  // paciente entra SEMPRE; o aviso só quando foi de fato enviado (janela de 6h).
+  await salvarFallback(clinicaId, telefone, {
+    user: mensagem || '[Mensagem sem texto — áudio/mídia]',
+    assistant: avisoEnviado || undefined,
+  });
   if ((suspensoNotificado.get(clinicaId) || 0) < now - 24 * 3600 * 1000) {
     suspensoNotificado.set(clinicaId, now);
     try {
@@ -185,7 +221,9 @@ async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
           const quando = new Date(ag.data_hora).toLocaleString('pt-BR', {
             timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
           });
-          await sendMessage(instanceName, telefone, `Presença confirmada! ✅ Te esperamos ${quando}.`);
+          const respostaConfirma = `Presença confirmada! ✅ Te esperamos ${quando}.`;
+          await sendMessage(instanceName, telefone, respostaConfirma);
+          await salvarFallback(clinicaId, telefone, { user: mensagem, assistant: respostaConfirma, encerrar: true });
           return;
         }
       }
@@ -207,6 +245,7 @@ async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
         ? 'De nada! 😊 Precisando, é só chamar.'
         : 'Combinado! 😊 Qualquer coisa, é só chamar.';
       await sendMessage(instanceName, telefone, resposta);
+      await salvarFallback(clinicaId, telefone, { user: mensagem, assistant: resposta, encerrar: true });
       return;
     }
   }
@@ -219,8 +258,11 @@ async function processarBuffer(instanceName, clinicaId, telefone, mensagem) {
     // O paciente recebe um aviso honesto e a clínica uma notificação para assumir a conversa.
     console.error('[buffer] falha total no processamento:', e.message);
     try {
-      await sendMessage(instanceName, telefone,
-        'Tive um probleminha técnico agora. Já avisei a equipe da clínica — eles vão te responder por aqui. 🙏');
+      const avisoFalha = 'Tive um probleminha técnico agora. Já avisei a equipe da clínica — eles vão te responder por aqui. 🙏';
+      await sendMessage(instanceName, telefone, avisoFalha);
+      // Só o assistant: a fala do paciente já foi salva pelo processarMensagem na
+      // maior parte dos caminhos — gravar user aqui duplicaria.
+      await salvarFallback(clinicaId, telefone, { assistant: avisoFalha });
     } catch { /* nem o fallback saiu — fica só a notificação */ }
     try {
       await supabase.from('notificacoes').insert({
@@ -298,6 +340,19 @@ router.post('/whatsapp', async (req, res) => {
     const telefone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');
     if (!telefone) return res.sendStatus(200);
 
+    // Extrai texto de todos os tipos comuns de mensagem de texto (antes do gate de
+    // billing — custo zero — porque responderSuspenso grava a fala do paciente).
+    const mensagem = data?.message?.conversation ||
+                     data?.message?.extendedTextMessage?.text ||
+                     data?.message?.imageMessage?.caption ||
+                     data?.message?.videoMessage?.caption ||
+                     data?.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+                     data?.message?.ephemeralMessage?.message?.conversation ||
+                     data?.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+                     data?.message?.viewOnceMessage?.message?.conversation ||
+                     data?.message?.viewOnceMessage?.message?.extendedTextMessage?.text ||
+                     '';
+
     // Resolve a clínica UMA vez (todos os caminhos precisam) e aplica o gate de billing
     // ANTES de qualquer custo (Whisper no áudio, Sonnet no texto).
     const { data: instancia } = await supabase
@@ -310,21 +365,9 @@ router.post('/whatsapp', async (req, res) => {
     const billing = await getBillingInfo(instancia.clinica_id);
     if (!['active', 'trial'].includes(billing.status)) {
       res.sendStatus(200);
-      await responderSuspenso(instanceName, telefone, instancia.clinica_id, billing);
+      await responderSuspenso(instanceName, telefone, instancia.clinica_id, billing, mensagem);
       return;
     }
-
-    // Extrai texto de todos os tipos comuns de mensagem de texto
-    const mensagem = data?.message?.conversation ||
-                     data?.message?.extendedTextMessage?.text ||
-                     data?.message?.imageMessage?.caption ||
-                     data?.message?.videoMessage?.caption ||
-                     data?.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
-                     data?.message?.ephemeralMessage?.message?.conversation ||
-                     data?.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-                     data?.message?.viewOnceMessage?.message?.conversation ||
-                     data?.message?.viewOnceMessage?.message?.extendedTextMessage?.text ||
-                     '';
 
     // Áudio (voz ou arquivo de áudio) — transcreve com Whisper e entra no MESMO buffer
     // do texto (áudio + balões de texto do mesmo burst viram uma única chamada ao modelo).
@@ -337,6 +380,8 @@ router.post('/whatsapp', async (req, res) => {
         // Trava do atendimento humano vale também para respostas fixas — a Sofia não
         // fala por cima do atendente nem para pedir calma.
         if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
+        // Flood NÃO grava em conversas/mensagens (decisão deliberada — vale também
+        // para o aviso equivalente do fluxo de texto, mais abaixo).
         await sendMessage(instanceName, telefone, 'Recebemos muitas mensagens seguidas. Aguarde um momento antes de continuar, por favor. 🙏');
         return;
       }
@@ -348,9 +393,13 @@ router.post('/whatsapp', async (req, res) => {
         console.error('Erro ao transcrever áudio:', e);
         if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
         await new Promise(r => setTimeout(r, 1200));
-        await sendMessage(instanceName, telefone,
-          'Não consegui ouvir seu áudio. Pode digitar o que precisa? 🙏'
-        );
+        const respostaAudio = 'Não consegui ouvir seu áudio. Pode digitar o que precisa? 🙏';
+        await sendMessage(instanceName, telefone, respostaAudio);
+        // Sem isto a fala do paciente EVAPORAVA — nem como user era gravada.
+        await salvarFallback(instancia.clinica_id, telefone, {
+          user: '[Áudio recebido — não foi possível transcrever]',
+          assistant: respostaAudio,
+        });
       }
       return;
     }
@@ -367,9 +416,12 @@ router.post('/whatsapp', async (req, res) => {
       if (temMidia) {
         if (await conversaComTravaHumana(instancia.clinica_id, telefone)) return;
         await new Promise(r => setTimeout(r, 1200));
-        await sendMessage(instanceName, telefone,
-          'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?'
-        );
+        const respostaMidia = 'Por enquanto só consigo ler mensagens de texto. Pode digitar o que precisa?';
+        await sendMessage(instanceName, telefone, respostaMidia);
+        await salvarFallback(instancia.clinica_id, telefone, {
+          user: '[Mídia recebida (imagem/vídeo/documento)]',
+          assistant: respostaMidia,
+        });
       }
       return;
     }
@@ -386,7 +438,10 @@ router.post('/whatsapp', async (req, res) => {
         await supabase.from('pacientes').update({ recall_opt_out: true })
           .eq('clinica_id', instancia.clinica_id).eq('telefone', telefone);
       } catch (e) { console.error('[optout]', e.message); }
-      await sendMessage(instanceName, telefone, 'Pronto! Você não vai mais receber nossos lembretes de retorno. Se precisar agendar, é só chamar quando quiser. 💙');
+      const respostaOptOut = 'Pronto! Você não vai mais receber nossos lembretes de retorno. Se precisar agendar, é só chamar quando quiser. 💙';
+      await sendMessage(instanceName, telefone, respostaOptOut);
+      // Rastro LGPD do descadastro.
+      await salvarFallback(instancia.clinica_id, telefone, { user: mensagem, assistant: respostaOptOut, encerrar: true });
       return;
     }
 
