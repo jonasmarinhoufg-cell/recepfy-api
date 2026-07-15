@@ -1847,6 +1847,47 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       }
     }
 
+    // 12d. Perfil revelado espontaneamente (CRM fase 2) — 75% dos leads ficavam SEM NOME
+    //      porque a extração só acontecia quando o agendamento fechava. Aqui o nome/
+    //      interesse dito em conversa vira cadastro na hora. Best-effort: NUNCA pode
+    //      quebrar nem atrasar a resposta ao paciente (try/catch total).
+    if (parsed.perfil) {
+      try {
+        const perf = parsed.perfil;
+        // Nome: só grava se o cadastro ainda está vazio — atualizarNomePaciente já
+        // aplica .is('nome', null), nunca sobrescreve um nome existente.
+        if (typeof perf.nome === 'string' && perf.nome.trim()) {
+          await atualizarNomePaciente(paciente.id, perf.nome);
+        }
+        const interesse = typeof perf.interesse === 'string' ? perf.interesse.trim() : '';
+        if (interesse) {
+          // (a) Diário do paciente (mesmo formato "[dd/mm/aaaa] ..." de salvarMemoriaPaciente),
+          //     com guarda anti-duplicata: o marcador é stripado antes de salvar, então o
+          //     modelo pode re-emitir o mesmo interesse em turnos seguidos — não anexa se
+          //     o FIM da memória já contém o mesmo texto. `paciente` foi lido no início
+          //     deste turno (select *), fresco o bastante para a guarda.
+          const entradaInteresse = `Interesse demonstrado: ${interesse}`;
+          const fimMemoria = String(paciente.memoria || '').slice(-300);
+          if (!fimMemoria.includes(entradaInteresse)) {
+            await salvarMemoriaPaciente(paciente.id, entradaInteresse);
+          }
+          // (b) Tag sugerida em pacientes.tags (text[], migration 20260726): lowercase,
+          //     curta, sem duplicar. Degrade silencioso se a coluna ainda não existe.
+          const tag = interesse.toLowerCase().replace(/\s+/g, ' ').slice(0, 40).trim();
+          const tagsAtuais = Array.isArray(paciente.tags) ? paciente.tags : [];
+          if (tag && !tagsAtuais.includes(tag)) {
+            const { error: tagErr } = await supabase.from('pacientes')
+              .update({ tags: [...new Set([...tagsAtuais, tag])] })
+              .eq('id', paciente.id);
+            if (tagErr && !(tagErr.code === '42703' || tagErr.code === 'PGRST204' ||
+                /does not exist|schema cache|could not find/i.test(tagErr.message || ''))) {
+              console.error('[PERFIL] tag:', tagErr.message);
+            }
+          }
+        }
+      } catch (e) { console.error('[PERFIL]', e.message); }
+    }
+
     // Salva a mensagem final da Sofia (pode ter sido corrigida em caso de slot_taken)
     await salvarMensagem(conversa.id, 'assistant', finalMessage, response.usage?.output_tokens || 0);
 

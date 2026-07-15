@@ -11,6 +11,7 @@ function parseResponse(text) {
     urgencia:     null,
     demandaReprimida: null,
     duvidaSemResposta: null,
+    perfil:       null,
   };
 
   // Agendamento confirmado
@@ -109,6 +110,23 @@ function parseResponse(text) {
     } catch (e) {
       console.error('Erro ao parsear dúvida sem resposta:', e.message);
       result.message = result.message.replace(/\[DUVIDA_SEM_RESPOSTA:\{.*?\}\]/s, '').trim();
+    }
+  }
+
+  // Perfil revelado espontaneamente (CRM fase 2) — nome/interesse dito em conversa,
+  // fora do fluxo de agendamento. Mesmo padrão endurecido dos marcadores acima:
+  // regex exige o objeto {…} completo e o strip acontece mesmo com JSON quebrado
+  // (a tag NUNCA pode vazar para o paciente).
+  const perfilMatch = text.match(/\[PERFIL:(\{.*?\})\]/s);
+  if (perfilMatch) {
+    try {
+      result.perfil = JSON.parse(perfilMatch[1]);
+      // /g: se o modelo emitir DOIS marcadores PERFIL na mesma resposta (viola o
+      // "máx 1", mas acontece), o strip pega todos — só o primeiro é processado.
+      result.message = result.message.replace(/\[PERFIL:\{.*?\}\]/gs, '').trim();
+    } catch (e) {
+      console.error('Erro ao parsear perfil:', e.message);
+      result.message = result.message.replace(/\[PERFIL:\{.*?\}\]/gs, '').trim();
     }
   }
 
