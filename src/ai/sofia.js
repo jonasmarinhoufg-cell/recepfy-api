@@ -121,12 +121,36 @@ function invalidateCache(clinicaId) {
 // ─── PACIENTE ─────────────────────────────────────────────────────────────────
 
 async function getOrCreatePaciente(clinicaId, telefone) {
-  const { data: paciente } = await supabase
+  let { data: paciente } = await supabase
     .from('pacientes')
     .select('*')
     .eq('clinica_id', clinicaId)
     .eq('telefone', telefone)
     .maybeSingle();
+
+  // O painel grava telefone SEM o DDI 55; o jid do WhatsApp vem com. Sem este
+  // fallback o match exato falha e nasce um paciente DUPLICADO — e o NPS/perfil
+  // do original nunca casa. Sufixo de 8 dígitos (mesmo matcher suf8 do front),
+  // só com casamento INEQUÍVOCO (exatamente 1) — melhor criar novo do que
+  // colar a conversa na ficha errada.
+  if (!paciente) {
+    const suf8 = String(telefone || '').replace(/\D/g, '').slice(-8);
+    if (suf8.length === 8) {
+      const { data: candidatos } = await supabase
+        .from('pacientes')
+        .select('*')
+        .eq('clinica_id', clinicaId)
+        .like('telefone', `%${suf8}`)
+        .limit(2);
+      if (candidatos && candidatos.length === 1) {
+        paciente = candidatos[0];
+        // Canoniza para a forma do jid: os próximos contatos casam no exato.
+        supabase.from('pacientes').update({ telefone })
+          .eq('id', paciente.id)
+          .then(() => {}).catch(e => console.error('canoniza telefone:', e.message));
+      }
+    }
+  }
 
   if (paciente) {
     // Atualiza último contato sem bloquear o fluxo
@@ -604,6 +628,9 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   }
 
   const dataHoraAgendamento = parseBookingDateTime(booking.data, booking.hora);
+  // Exibição reflete o que foi GRAVADO (parse ignora ano/formato cru do modelo).
+  const dataExibicao = formatBRT(dataHoraAgendamento, { day: '2-digit', month: '2-digit', year: 'numeric' });
+  const horaExibicao = formatBRT(dataHoraAgendamento, { hour: '2-digit', minute: '2-digit' });
 
   const origem = isReagendamento ? 'reagendamento' : 'sofia';
 
@@ -668,8 +695,8 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
   } catch {}
 
   const notifCorpo = isReagendamento && dataAnterior
-    ? `${booking.nome} — reagendado de ${dataAnterior} → ${booking.data} às ${booking.hora}`
-    : `${booking.nome} — ${booking.data} às ${booking.hora} — ${booking.motivo}`;
+    ? `${booking.nome} — reagendado de ${dataAnterior} → ${dataExibicao} às ${horaExibicao}`
+    : `${booking.nome} — ${dataExibicao} às ${horaExibicao} — ${booking.motivo}`;
   const { error: notifErr } = await supabase.from('notificacoes').insert({
     clinica_id:  clinicaId,
     medico_id:   medicoId,
@@ -704,7 +731,7 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
         if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`);
         linhas.push(
           `*Paciente:* ${booking.nome}`,
-          `*Data:* ${booking.data} às ${booking.hora}`,
+          `*Data:* ${dataExibicao} às ${horaExibicao}`,
           `*Motivo:* ${booking.motivo || '—'}`,
         );
         if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
@@ -724,8 +751,8 @@ async function salvarAgendamento(clinicaId, pacienteId, conversaId, booking, mod
         const linhas = [header, ''];
         if (isReagendamento && dataAnterior) linhas.push(`*Horário anterior:* ${dataAnterior}`, '');
         linhas.push(
-          `*Data:* ${booking.data}`,
-          `*Horário:* ${booking.hora}`,
+          `*Data:* ${dataExibicao}`,
+          `*Horário:* ${horaExibicao}`,
           `*Médico:* ${booking.medico}`,
         );
         if (booking.convenio) linhas.push(`*Convênio:* ${booking.convenio}`);
@@ -1456,23 +1483,34 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
       return holdMsg;
     }
 
-    // 2b. #4 NPS pendente: paciente respondendo avaliação com número 1-5
+    // 2b. #4 NPS pendente: paciente respondendo a avaliação 1-5. Tolerante a
+    // resposta natural ("5!", "nota 4", "5 ⭐") e ao debounce que emenda balões
+    // ("5\nachei demorado"): a nota vem da 1ª linha, que precisa ser UM dígito
+    // 1-5 isolado (nunca captura "3 da tarde"). Se veio comentário junto, grava
+    // a nota e deixa a mensagem seguir o fluxo normal — o comentário merece
+    // resposta da IA, não o agradecimento enlatado.
     const npsPendente = await getNpsPendente(clinicaId, paciente.id);
-    if (npsPendente && /^[1-5]$/.test(mensagem.trim())) {
-      const nota = parseInt(mensagem.trim(), 10);
-      await supabase.from('agendamentos').update({ nps_nota: nota }).eq('id', npsPendente.id);
-      const conversa = await getOrCreateConversa(clinicaId, paciente.id);
-      await salvarMensagem(conversa.id, 'user', mensagem);
-      const respostas = [
-        'Lamentamos que a experiência não tenha sido boa. Seu retorno vai nos ajudar a melhorar.',
-        'Obrigado pelo retorno honesto. Vamos trabalhar para melhorar.',
-        'Obrigado pela avaliação! Seu retorno é importante para nós.',
-        'Que bom saber! Obrigado por avaliar.',
-        'Fico muito feliz! Obrigado. Até a próxima. 😊',
-      ];
-      const npsResp = respostas[nota - 1];
-      await salvarMensagem(conversa.id, 'assistant', npsResp);
-      return npsResp;
+    if (npsPendente) {
+      const linhasNps = mensagem.trim().split('\n');
+      const notaMatch = linhasNps[0].match(/^\s*(?:nota[:\s]*)?([1-5])\s*[.!)⭐️\s]*$/iu);
+      if (notaMatch) {
+        const nota = parseInt(notaMatch[1], 10);
+        await supabase.from('agendamentos').update({ nps_nota: nota }).eq('id', npsPendente.id);
+        if (linhasNps.length === 1) {
+          const conversa = await getOrCreateConversa(clinicaId, paciente.id);
+          await salvarMensagem(conversa.id, 'user', mensagem);
+          const respostas = [
+            'Lamentamos que a experiência não tenha sido boa. Seu retorno vai nos ajudar a melhorar.',
+            'Obrigado pelo retorno honesto. Vamos trabalhar para melhorar.',
+            'Obrigado pela avaliação! Seu retorno é importante para nós.',
+            'Que bom saber! Obrigado por avaliar.',
+            'Fico muito feliz! Obrigado. Até a próxima. 😊',
+          ];
+          const npsResp = respostas[nota - 1];
+          await salvarMensagem(conversa.id, 'assistant', npsResp);
+          return npsResp;
+        }
+      }
     }
 
     // 3. Conversa ativa (ou nova se passaram mais de 2h)
