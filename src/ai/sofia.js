@@ -1738,15 +1738,35 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
           paciente_telefone: telefone,
           conversa_id: conversa.id,
           valor_estimado: Number(d.valor) || 0,
+          // Vínculo direto com o paciente (CRM fase 1 — migration 20260726): dispensa
+          // o matcher por sufixo de telefone no painel. paciente é o dono da conversa,
+          // já resolvido lá em cima por getOrCreatePaciente.
+          paciente_id: paciente.id,
         };
         let { error: dErr } = await supabase.from('demanda_reprimida').insert(row);
-        // 'preco'/'adiamento' dependem da migration 20260723; se o check antigo recusar,
-        // rebaixa para 'outro' com o tipo no detalhe — perder o registro seria pior.
+        // FALLBACK 1 — coluna paciente_id ainda não existe (migration 20260726 pendente):
+        // refaz SEM o vínculo. A ORDEM dos dois fallbacks importa: com as DUAS migrations
+        // pendentes, o PostgREST recusa a coluna desconhecida ANTES de o insert chegar ao
+        // banco (PGRST204 precede qualquer 23514), então o erro de coluna aparece primeiro;
+        // o retry sem paciente_id ainda pode cair no check antigo de tipo, tratado no
+        // FALLBACK 2. Deleta de `row` (não copia) para o FALLBACK 2 herdar a forma certa.
+        if (dErr && (dErr.code === '42703' || dErr.code === 'PGRST204' ||
+            /does not exist|schema cache|could not find/i.test(dErr.message || ''))) {
+          delete row.paciente_id;
+          ({ error: dErr } = await supabase.from('demanda_reprimida').insert(row));
+        }
+        // FALLBACK 2 — 'preco'/'adiamento' dependem da migration 20260723; se o check
+        // antigo recusar, rebaixa para 'outro' com o tipo no detalhe — perder o registro
+        // seria pior. (Se o FALLBACK 1 rodou, `row` já vem sem paciente_id aqui.)
         if (dErr && (dErr.code === '23514' || /tipo_check/.test(dErr.message || ''))) {
           ({ error: dErr } = await supabase.from('demanda_reprimida').insert({
             ...row, tipo: 'outro', detalhe: `[${tipo}] ${row.detalhe || ''}`.trim(),
           }));
         }
+        // 23505 = corrida do select-then-insert contra o unique parcial da migration
+        // 20260726 (2 turnos simultâneos da mesma conversa): a "perda" é a duplicata
+        // que o dedup existe para impedir — resultado correto, não é erro.
+        if (dErr && (dErr.code === '23505' || /duplicate key/i.test(dErr.message || ''))) dErr = null;
         if (dErr) console.error('Erro ao registrar demanda reprimida:', dErr.message);
       } else if (tipo === 'preco' &&
         (dExistente.tipo === 'adiamento' ||
@@ -1761,8 +1781,25 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
         const patch = promoFallback
           ? { detalhe: `[preco] ${d.detalhe || ''}`.trim() }
           : { tipo: 'preco', detalhe: d.detalhe || undefined };
+        // Aproveita a promoção para carimbar o vínculo com o paciente (migration
+        // 20260726). NÃO lemos paciente_id no select do dedupe acima de propósito:
+        // pré-migration a coluna desconhecida derrubaria o select inteiro, dExistente
+        // viria null e o insert duplicaria a demanda. Gravar incondicionalmente é
+        // idempotente: o registro existente tem conversa_id desta conversa, cujo dono
+        // é este paciente — no pior caso corrige um backfill por sufixo que casou
+        // outro paciente. Se a coluna não existir, o FALLBACK 1 abaixo remove o campo.
+        patch.paciente_id = paciente.id;
         if (Number(d.valor) > 0 && !(Number(dExistente.valor_estimado) > 0)) patch.valor_estimado = Number(d.valor);
         let { error: upErr } = await supabase.from('demanda_reprimida').update(patch).eq('id', dExistente.id);
+        // FALLBACK 1 — coluna paciente_id ausente (migration 20260726 pendente); mesma
+        // ordem do insert acima: PGRST204 precede o 23514, e o retry sem o campo ainda
+        // pode cair no tipo_check (FALLBACK 2). Deleta de `patch` para o 2 herdar.
+        if (upErr && (upErr.code === '42703' || upErr.code === 'PGRST204' ||
+            /does not exist|schema cache|could not find/i.test(upErr.message || ''))) {
+          delete patch.paciente_id;
+          ({ error: upErr } = await supabase.from('demanda_reprimida').update(patch).eq('id', dExistente.id));
+        }
+        // FALLBACK 2 — check antigo de tipo (migration 20260723 pendente).
         if (upErr && (upErr.code === '23514' || /tipo_check/.test(upErr.message || ''))) {
           ({ error: upErr } = await supabase.from('demanda_reprimida')
             .update({ ...patch, tipo: 'outro', detalhe: `[preco] ${d.detalhe || ''}`.trim() })
