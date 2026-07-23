@@ -283,6 +283,13 @@ async function getOrCreateConversa(clinicaId, pacienteId) {
 const PLAN_CAPS = { solo: 300, solo_pro: 500, starter: 600, clinica: 1200, clinica_plan: 1200, clinica_plus: 1600, pro: 2500 };
 const CAP_PADRAO = 600;
 
+// Teto DURO do atendimento REATIVO (guard de margem): o fair-use abaixo só pausa
+// campanhas; este teto para o PRÓPRIO atendimento ao paciente de chamar o modelo ao
+// cruzar o limite de custo. Fator 2x no plano pago = folga generosa (só o descontrole
+// real bate). Trial tem um teto de ABUSO, não de valor.
+const FATOR_TETO_REATIVO = 2;
+const TETO_TRIAL_CONVERSAS = 100; // um trial não precisa de +100 conversas p/ provar valor — barra o blast de abuso
+
 let _capsCache = { at: 0, map: null };
 async function capsDoCatalogo() {
   if (Date.now() - _capsCache.at < 60_000) return _capsCache.map;
@@ -324,6 +331,24 @@ async function fairUseAtingido(clinicaId, planoCache = null) {
     const uso = await getUsoMensal(clinicaId);
     return uso >= cap;
   } catch { return false; } // na dúvida, não pausa (falha aberta a favor do cliente)
+}
+
+// TETO DURO do reativo: true quando o uso do mês cruza o LIMITE de custo — nesse ponto
+// a Sofia PARA de chamar o modelo mesmo no atendimento ao paciente (o hold humano cobre
+// o paciente, que nunca fica no vácuo). LIMITE: plano pago = cap * FATOR_TETO_REATIVO
+// (folga de 2x); trial = min(cap, TETO_TRIAL_CONVERSAS) (teto de abuso). DEGRADE-OPEN:
+// erro na checagem → FALSE (na dúvida NÃO bloqueia; o teto protege custo, não pode virar
+// negação de serviço por bug). billingStatus só é 'active' ou 'trial' aqui — o gate de
+// billing do webhook já barrou inativos antes de qualquer custo.
+async function tetoDuroAtingido(clinicaId, plano, billingStatus) {
+  try {
+    const cap = await capDoPlano(plano);
+    const uso = await getUsoMensal(clinicaId);
+    const limite = billingStatus === 'trial'
+      ? Math.min(cap, TETO_TRIAL_CONVERSAS)
+      : cap * FATOR_TETO_REATIVO;
+    return uso >= limite;
+  } catch { return false; } // degrade-open: na dúvida NÃO bloqueia o paciente
 }
 
 // Notificador diário: avisa o dono ao cruzar 80% e 100% do teto (dedup por mês via título).
@@ -529,7 +554,7 @@ async function encerrarConversa(conversaId, resolucao = 'ia') {
 // Gera um resumo da conversa com Claude Haiku (modelo mais barato).
 // Salva o resumo acumulado no perfil do paciente para enriquecer conversas futuras.
 
-async function gerarResumoConversa(conversaId) {
+async function gerarResumoConversa(conversaId, clinicaId = null) {
   const { data: msgs } = await supabase
     .from('mensagens')
     .select('role, conteudo')
@@ -551,6 +576,22 @@ async function gerarResumoConversa(conversaId) {
         content: `Resuma em até 2 frases o que aconteceu nesta conversa e qualquer informação útil sobre o paciente (motivo, preferências, condições mencionadas, desfecho). Português, direto, sem introdução.\n\n${texto}`,
       }],
     });
+    // Medidor de custo (ia_uso): o resumo Haiku também consome tokens — sem este log o
+    // medidor subestima o custo real da conversa (só o Sonnet era contado). Fire-and-forget
+    // e resiliente a migration pendente (mesmo shape do log do Sonnet). Haiku 4.5: $1 in /
+    // $5 out por 1M tokens. Nunca quebra o resumo se o insert falhar.
+    try {
+      const u = resp.usage || {};
+      const custoUsd = ((u.input_tokens || 0) * 1 + (u.output_tokens || 0) * 5) / 1e6;
+      supabase.from('ia_uso').insert({
+        clinica_id: clinicaId, conversa_id: conversaId, modelo: 'claude-haiku-4-5-20251001',
+        input_tokens: u.input_tokens || 0, output_tokens: u.output_tokens || 0,
+        cache_write_tokens: 0, cache_read_tokens: 0,
+        custo_usd: Number(custoUsd.toFixed(6)),
+      }).then(({ error }) => {
+        if (error && !/PGRST205|does not exist|schema cache/i.test(error.message || '')) console.error('[IA-USO haiku]', error.message);
+      });
+    } catch (e) { console.error('[IA-USO haiku]', e.message); }
     return resp.content[0]?.text?.trim() || null;
   } catch (e) {
     console.error('Erro ao gerar resumo de conversa:', e.message);
@@ -1521,6 +1562,42 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     // 3. Conversa ativa (ou nova se passaram mais de 2h)
     const conversa = await getOrCreateConversa(clinicaId, paciente.id);
 
+    // 3a. TETO DURO NO REATIVO (guard de margem): fecha o único cenário de prejuízo
+    // sem piso — ao cruzar o teto de custo, a Sofia PARA de chamar o modelo mesmo no
+    // atendimento ao paciente (o fair-use só pausa campanhas). config.clinica é
+    // select('*'), então plano e billing_status já vieram sem query extra. Só é
+    // avaliado DEPOIS dos gates existentes (billing/trava humana no webhook, handoff-
+    // hold 2a, NPS 2b) e ANTES do Sonnet. Degrade-open dentro de tetoDuroAtingido:
+    // erro → não bloqueia. Quando bate: salva a fala do paciente, entra em handoff-
+    // hold (24h — mesmo padrão do handoff, para os próximos turnos caírem no gate 2a
+    // e NÃO re-custarem), responde o mesmo aviso do hold humano (paciente nunca no
+    // vácuo) e notifica a clínica (dedup 1x/dia via data no título, molde do fair-use).
+    if (await tetoDuroAtingido(clinicaId, config.clinica.plano, config.clinica.billing_status)) {
+      console.warn(`[TETO-DURO] teto reativo atingido — clinica=${clinicaId} plano=${config.clinica.plano} billing=${config.clinica.billing_status}; pausando automático (handoff-hold)`);
+      await salvarMensagem(conversa.id, 'user', mensagem);
+      await encerrarConversa(conversa.id, 'handoff'); // status=encerrada, resolucao=handoff, encerrada_em=now
+      const holdMsg = 'Nossa equipe vai te atender em breve. 🙏';
+      await salvarMensagem(conversa.id, 'assistant', holdMsg);
+      // Avisa a clínica — dedup diário pela data no título (molde do verificarFairUse).
+      try {
+        const ehTrial = config.clinica.billing_status === 'trial';
+        const hoje = new Date().toISOString().slice(0, 10); // "2026-07-23" — âncora do dedup
+        const titulo = `Limite de conversas ultrapassado — atendimento automático pausado (${hoje})`;
+        const { data: ja } = await supabase.from('notificacoes').select('id')
+          .eq('clinica_id', clinicaId).eq('titulo', titulo).limit(1).maybeSingle();
+        if (!ja) {
+          const cap = await capDoPlano(config.clinica.plano);
+          await supabase.from('notificacoes').insert({
+            clinica_id: clinicaId, tipo: 'sistema', titulo,
+            corpo: ehTrial
+              ? `Sua clínica ultrapassou o limite de conversas do período de teste (${TETO_TRIAL_CONVERSAS}). Para não gerar custo além do teste, a Sofia pausou o atendimento automático — atenda os pacientes manualmente pelo painel ou finalize a assinatura para liberar o atendimento completo.`
+              : `Sua clínica ultrapassou ${FATOR_TETO_REATIVO}x o limite de ${cap} conversas do plano neste mês. Para não gerar custo muito além do plano, a Sofia pausou o atendimento automático — atenda os pacientes manualmente pelo painel ou faça um upgrade de plano para religar o automático.`,
+          });
+        }
+      } catch (e) { console.error('[TETO-DURO]', e.message); }
+      return holdMsg;
+    }
+
     // 4. Histórico desta conversa (últimas 20 mensagens)
     let historico = await getHistorico(conversa.id);
 
@@ -1636,7 +1713,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
           .gte('enviado_em', new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString())
           .then(({ error }) => { if (error) console.error('[RECALL] conversão:', error.message); });
         await encerrarConversa(conversa.id, 'ia');
-        gerarResumoConversa(conversa.id)
+        gerarResumoConversa(conversa.id, clinicaId)
           .then(r => salvarMemoriaPaciente(paciente.id, r))
           .catch(e => console.error('Resumo agendamento:', e.message));
       }
@@ -1646,7 +1723,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     if (parsed.cancelamento) {
       await cancelarAgendamento(clinicaId, paciente.id);
       await encerrarConversa(conversa.id, 'ia');
-      gerarResumoConversa(conversa.id)
+      gerarResumoConversa(conversa.id, clinicaId)
         .then(r => salvarMemoriaPaciente(paciente.id, r))
         .catch(e => console.error('Resumo cancelamento:', e.message));
     }
@@ -1663,7 +1740,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
         finalMessage = 'Tive um probleminha técnico para concluir o reagendamento. Sua consulta anterior continua marcada — pode tentar de novo em instantes?';
       } else {
         await encerrarConversa(conversa.id, 'ia');
-        gerarResumoConversa(conversa.id)
+        gerarResumoConversa(conversa.id, clinicaId)
           .then(r => salvarMemoriaPaciente(paciente.id, r))
           .catch(e => console.error('Resumo reagendamento:', e.message));
       }
@@ -1672,7 +1749,7 @@ async function processarMensagem(clinicaId, telefone, mensagem) {
     // 11. Handoff — encerra, gera resumo para contexto do atendente e notifica
     if (parsed.handoff) {
       await encerrarConversa(conversa.id, 'handoff');
-      const resumo = await gerarResumoConversa(conversa.id);
+      const resumo = await gerarResumoConversa(conversa.id, clinicaId);
       if (resumo) salvarMemoriaPaciente(paciente.id, resumo).catch(e => console.error('Memória handoff:', e.message));
       const nomePaciente = paciente.nome || telefone;
       const contexto = resumo ? `\n\nContexto: ${resumo}` : '';
