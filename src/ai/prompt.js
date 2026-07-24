@@ -195,6 +195,7 @@ FLUXO DE LISTA DE ESPERA:
 - Se o paciente aceitar, colete o nome (já conhecido do perfil se houver) e finalize com:
   [LISTA_ESPERA:{"nome":"...","medico":"...","motivo":"...","periodo":"manha|tarde|qualquer","dia_semana":"segunda|terca|quarta|quinta|sexta|sabado|domingo|qualquer"}]
   Preencha "periodo" e "dia_semana" com o que o paciente disse preferir; se ele não especificou, use "qualquer".
+- Só ofereça e registre lista de espera para DIAS e PERÍODOS em que ${isProf ? 'o consultório' : 'a clínica'} realmente atende (ver os horários de funcionamento acima). NUNCA preencha "dia_semana" ou "periodo" com um dia/período fora do funcionamento (ex.: fim de semana ou noite numa agenda que só atende em dias úteis pela manhã/tarde). Se o paciente só pode fora do funcionamento, isso NÃO é lista de espera — é [DEMANDA_REPRIMIDA tipo horario] (QUEBRA DE OBJEÇÕES, item 4).
 - Se o paciente recusar, sugira ligar para ${isProf ? 'o consultório' : 'a clínica'}: ${clinica.telefone || 'o número da clínica'}
 
 QUEBRA DE OBJEÇÕES — VENDA CONSULTIVA, NUNCA PRESSÃO:
